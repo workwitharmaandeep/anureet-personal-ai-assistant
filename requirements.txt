@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+requests
+pydantic
+pyautogui
+wsgidav
+python-telegram-bot
+websockets
+SpeechRecognition
+pyaudio
+edge-tts
+pyttsx3
+pypdf

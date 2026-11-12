@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anureet — Local Voice AI Assistant</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-area">
+        <div class="logo-icon" aria-hidden="true">🎙️</div>
+        <div>
+          <h1 class="app-title">Anureet Voice AI</h1>
+          <div class="app-subtitle">Hands-free Local Voice Assistant</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <label for="lang-select" class="visually-hidden">Voice recognition language</label>
+        <select id="lang-select" class="lang-select" aria-label="Voice recognition language" title="Speech recognition language">
+          <option value="en-IN" selected>Hinglish / EN-IN</option>
+          <option value="hi-IN">Hindi (hi-IN)</option>
+          <option value="en-US">English (en-US)</option>
+        </select>
+        <button
+          type="button"
+          class="btn-sm"
+          id="tts-btn"
+          aria-pressed="true"
+          aria-label="Mute voice responses"
+          title="Toggle voice responses"
+        >🔊 Voice On</button>
+        <div class="status-badge" id="connection-status" role="status" aria-live="polite">
+          <div class="status-dot" aria-hidden="true"></div>
+          <span id="status-text">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <div class="nav-tabs" role="tablist" aria-label="Workspace views">
+      <button
+        type="button"
+        class="tab-btn"
+        id="tab-assistant"
+        role="tab"
+        aria-selected="true"
+        tabindex="0"
+        data-tab="assistant"
+      >
+        🎙️ Anureet Voice
+      </button>
+      <button
+        type="button"
+        class="tab-btn"
+        id="tab-filemanager"
+        role="tab"
+        aria-selected="false"
+        tabindex="-1"
+        data-tab="filemanager"
+      >
+        📂 File Manager
+      </button>
+    </div>
+
+    <main class="main-workspace">
+      <!-- TAB 1: AI Assistant -->
+      <section
+        class="tab-content active"
+        id="content-assistant"
+        role="tabpanel"
+        aria-labelledby="tab-assistant"
+      >
+        <div class="chat-container" id="chat-box" aria-live="polite" aria-relevant="additions">
+          <!-- Default Welcome Message -->
+          <div class="message agent">
+            <div class="bubble">
+              🎙️ Hello! I am <b>Anureet</b>, your local hands-free voice AI assistant.<br><br>
+              • <b>Laptop Voice Mode</b>: Run <code>python voice_assistant.py</code> on your laptop for continuous wake-word listening ("Anureet")!<br>
+              • <b>Mobile Voice Mode</b>: Tap the microphone button below or speak your commands directly.
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick Command Chips -->
+        <div class="quick-chips" aria-label="Quick commands">
+          <button type="button" class="chip" data-command="Anureet, open Notepad and write my meeting notes">📝 Open Notepad</button>
+          <button type="button" class="chip" data-command="Anureet, what is today's weather in Kurukshetra?">🌤️ Weather</button>
+          <button type="button" class="chip" data-command="Anureet, what is the USD to INR exchange rate?">💵 USD to INR</button>
+          <button type="button" class="chip" data-command="Anureet, create a white layer and import video in Premiere Pro">🎬 Premiere Import</button>
+          <button type="button" class="chip" data-command="Anureet, explain Heisenberg's Uncertainty Principle">⚛️ Uncertainty Principle</button>
+        </div>
+
+        <!-- Input Bar -->
+        <form class="chat-input-bar" id="chat-form">
+          <button
+            type="button"
+            class="icon-btn"
+            id="mic-btn"
+            aria-pressed="false"
+            aria-label="Start voice input"
+            title="Voice Input"
+          >
+            🎙️
+          </button>
+          <label for="user-input" class="visually-hidden">Command input</label>
+          <input
+            type="text"
+            class="chat-input"
+            id="user-input"
+            autocomplete="off"
+            placeholder="Say 'Anureet' or type your command..."
+          >
+          <button
+            type="submit"
+            class="icon-btn primary"
+            id="send-btn"
+            aria-label="Send command"
+            title="Send Command"
+          >
+            ➔
+          </button>
+        </form>
+      </section>
+
+      <!-- TAB 2: File Manager -->
+      <section
+        class="tab-content"
+        id="content-filemanager"
+        role="tabpanel"
+        aria-labelledby="tab-filemanager"
+        hidden
+      >
+        <div class="filemanager-container">
+          <!-- Toolbar -->
+          <div class="toolbar">
+            <button type="button" class="btn-sm" id="up-btn">⬆️ Up</button>
+            <div class="path-display" id="current-path-text" aria-label="Current directory">/</div>
+            <button type="button" class="btn-sm" id="refresh-btn">🔄 Refresh</button>
+          </div>
+
+          <!-- Upload Box -->
+          <button type="button" class="upload-box" id="upload-trigger-btn">
+            <span>📤 <b>Upload File to Laptop</b></span>
+            <span class="upload-hint" id="upload-status">Tap to select file from mobile storage</span>
+          </button>
+          <input type="file" id="file-input" class="visually-hidden" tabindex="-1">
+
+          <!-- File Listing -->
+          <div class="file-list" id="file-list-box">
+            <div class="empty-state">Select File Manager to browse files.</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script defer src="app.js"></script>
+</body>
+</html>
