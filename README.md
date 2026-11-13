@@ -14,9 +14,12 @@ Anureet is a privacy-first, local AI desktop and voice assistant powered by **Ol
 - **Floating Corner Orb & HUD Widget (`anureet_widget.py`)**:
   - Lightweight built-in `tkinter` always-on-top neural orb (`Idle`, `Listening`, `Thinking`, `Speaking`) with a click-to-expand dark HUD chat panel, offline mic button, `Esc` speech cutoff, and global Windows hotkey (`Ctrl+Space` / `Ctrl+Alt+Space`).
 - **Hands-Free Multilingual Voice Assistant (`voice_assistant.py`)**:
-  - Wake-word activation (`"Anureet"`, `"Hey Anureet"`, Hinglish/Devanagari & phonetic variants) with a **60-second conversational follow-up window** and `<30ms` speech interruption (`Esc` / `q` / `Ctrl+D`).
+  - **Dual Listening Modes**:
+    - **Strict Command Mode (Default)**: Requires wake word (`"Anureet"`, `"Hey Anureet"`, Hinglish/Devanagari variants) at the start of every command. Background noise and utterances without the wake word are strictly ignored and never execute.
+    - **1-Minute Continuous Chat Mode**: Triggered by voice (*"Anureet, listen continuously"*, *"continuous mode"*, *"baat karte raho"*) or via the widget HUD `♾️` button. Opens a 60-second back-and-forth conversational window with a live countdown where saying "Anureet" every sentence is not required. Automatically reverts to Strict Mode when 60s expires or when saying *"stop continuous mode"*.
+  - **Zero Speech Dropping & Echo Prevention**: SAPI5 speech wait loop handles audio hardware initialization delay (~120ms) without prematurely terminating, and enforces an acoustic grace period before microphone unmuting to eliminate self-echo interruptions.
   - **Offline Multilingual STT Priority**: Faster-Whisper (`small` multilingual model with CUDA auto-detection / `int8` CPU fallback, Silero VAD, and Hinglish wake-word biasing), Vosk (`model/`), or `SpeechRecognition` (`en-IN`) fallback.
-  - **Language-Matched Responses & TTS**: Automatically matches the user's language (English, Hindi, Hinglish, etc.) and selects `hi-IN-SwaraNeural` or `en-IN-NeerjaNeural` in `edge-tts`, with Piper -> `pyttsx3` -> PowerShell SAPI5 offline fallbacks.
+  - **Language-Matched Responses & TTS**: Automatically matches the user's language (English, Hindi, Hinglish, etc.) and selects `hi-IN-SwaraNeural` or `en-IN-NeerjaNeural` in `edge-tts`, with Piper -> `pyttsx3` -> PowerShell SAPI5 offline fallbacks. Interruption supported via `Esc` / `q` / `Ctrl+D`.
 - **Desktop, Creative & Research Tools (`tools/`)**:
   - **OS & Apps (`os_tools.py`)**: Launch/close Windows apps (Notepad, Chrome, Spotify, FL Studio, Premiere Pro, After Effects, Word, Explorer, Task Manager), write/save Notepad notes, open URLs, and lock/shutdown controls.
   - **GUI & Screen Control (`gui_vision_tools.py`, `live_screen_vision.py`)**: Screenshots (saved to `uploads/screenshots/`), window focusing, mouse clicks, keyboard hotkeys, scrolling, Chrome search, and Spotify playback.
@@ -140,7 +143,7 @@ Open `http://localhost:8000` in your browser (or `http://<your-tailscale-or-lan-
 ```powershell
 .\venv\Scripts\python.exe voice_assistant.py
 ```
-Say **"Anureet"** to wake the assistant and issue commands continuously within the 60-second active window.
+Say **"Anureet [command]"** to execute commands in Strict Mode. To converse freely without saying "Anureet" before every phrase, say **"Anureet, listen continuously"** (or click `♾️` in the widget) for a 1-minute back-and-forth session.
 
 ### 3. Floating Animated Model Widget & HUD
 ```powershell
@@ -148,6 +151,7 @@ Say **"Anureet"** to wake the assistant and issue commands continuously within t
 ```
 - Displays the animated Chibi 3D Anureet model (`static/assets/anureet_avatar.png`, customizable via `WIDGET_AVATAR_PATH`) with live state effects (`idle`, `listening`, `thinking`, `speaking`) and a floating instruction caption bubble.
 - Single-click the avatar (or press `Ctrl+Space` / `Ctrl+Alt+Space`) to open the dark HUD chat panel, double-click or click `🎤` for voice commands, click `👂` for Always-Listen wake-word mode (`"Anureet ..."`), and press `Esc` anytime to stop speech output.
+- Click `💬` in the HUD header, press `Ctrl+B` / `Ctrl+H`, or right-click to toggle/hide the bottom chat input bar for a full-height monitoring view. Preferences are automatically persisted across restarts.
 
 ### 4. Telegram Bot (Optional)
 ```powershell

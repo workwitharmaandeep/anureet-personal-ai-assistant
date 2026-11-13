@@ -3,16 +3,21 @@ Human-like GUI Automation, Screen Perception, and Mouse/Keyboard Control Module.
 Provides robust window-focused typing, screen vision, link clicking, button clicking, profile picking, and key press tools.
 """
 
+import atexit
 import base64
 import ctypes
+import difflib
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -255,24 +260,70 @@ def list_open_windows() -> dict:
         return {"status": "error", "message": f"Failed to list open windows: {e}"}
 
 
-def focus_window(title_query: str) -> dict:
+def focus_window(title_query: str = "", **kwargs) -> dict:
     """Focus and restore an open desktop window whose title matches title_query."""
-    query = re.sub(r'[.?!,;:"\']+$', "", (title_query or "").strip()).strip()
+    raw_q = title_query or kwargs.get("query") or kwargs.get("app_name") or kwargs.get("window_title") or kwargs.get("title") or ""
+    query = re.sub(r'[.?!,;:"\']+$', "", str(raw_q).strip()).strip()
     if not query:
         return {"status": "error", "message": "Specify a window title to focus."}
+
+    # Phonetic and alias resolution for window title query
+    try:
+        from tools.query_normalizer import resolve_app_name
+        resolved_title = resolve_app_name(query)
+        if resolved_title and resolved_title != query:
+            query = resolved_title
+    except Exception:
+        pass
+
     q_low = query.lower()
     q_compact = q_low.replace(" ", "")
     try:
         import pygetwindow as gw
 
+        all_wins = [
+            w for w in gw.getAllWindows()
+            if (w.title or "").strip() and (w.title or "").strip().lower() not in _ANUREET_WINDOW_TITLES
+        ]
         candidates = []
-        for w in gw.getAllWindows():
+        for w in all_wins:
             title = (w.title or "").strip()
-            if not title or title.lower() in _ANUREET_WINDOW_TITLES:
-                continue
             t_low = title.lower()
             if q_low in t_low or (len(q_compact) >= 3 and q_compact in t_low.replace(" ", "")):
                 candidates.append(w)
+
+        if not candidates:
+            try:
+                from tools.query_normalizer import resolve_app_name
+                resolved_with_wins = resolve_app_name(query, open_window_titles=[w.title for w in all_wins])
+                if resolved_with_wins and resolved_with_wins != query:
+                    rw_low = resolved_with_wins.lower()
+                    rw_compact = rw_low.replace(" ", "")
+                    for w in all_wins:
+                        title = (w.title or "").strip()
+                        t_low = title.lower()
+                        if rw_low in t_low or (len(rw_compact) >= 3 and rw_compact in t_low.replace(" ", "")):
+                            candidates.append(w)
+            except Exception:
+                pass
+
+        if not candidates:
+            title_map = {w.title.strip().lower(): w for w in all_wins}
+            close = difflib.get_close_matches(q_low, list(title_map.keys()), n=1, cutoff=0.55)
+            if close:
+                candidates.append(title_map[close[0]])
+            else:
+                try:
+                    from tools.os_tools import _match_installed_app
+                    matched_app = _match_installed_app(query)
+                    if matched_app:
+                        app_low = (matched_app["name"] if isinstance(matched_app, dict) else str(matched_app)).lower()
+                        for w in all_wins:
+                            w_low = w.title.strip().lower()
+                            if app_low in w_low or w_low in app_low:
+                                candidates.append(w)
+                except Exception:
+                    pass
 
         if not candidates:
             return {"status": "error", "message": f"No open window matching '{query}' found."}
@@ -302,6 +353,11 @@ def _get_target_hwnd(app_name: str = "") -> Tuple[Optional[int], str, str]:
     """Return (hwnd, title, error_message) for target app or top visible non-Anureet window."""
     clean_app = re.sub(r'[.?!,;:"\']+$', "", (app_name or "").strip()).strip()
     if clean_app:
+        try:
+            from tools.query_normalizer import resolve_app_name
+            clean_app = resolve_app_name(clean_app)
+        except Exception:
+            pass
         res = focus_window(clean_app)
         if res.get("status") != "success":
             return None, "", res.get("message", f"Could not focus '{clean_app}'.")
@@ -344,31 +400,153 @@ def _get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
     return None
 
 
+_PS_PRELOAD_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null
+    [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
+    [Windows.Storage.FileAccessMode, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
+    $script:AnureetAsTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
+        Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    Function Global:Anureet-Await($op, $resType) {
+        $t = $script:AnureetAsTaskGeneric.MakeGenericMethod($resType).Invoke($null, @($op))
+        $t.Wait(-1) | Out-Null
+        $t.Result
+    }
+    $script:AnureetOcrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+} catch {}
+"""
+
+
+class _PersistentPowerShellWorker:
+    """Single background powershell.exe pipe with UIA + WinRT OCR preloaded once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._line_queue: Optional["queue.Queue[Optional[str]]"] = None
+        self._reader_thread: Optional[threading.Thread] = None
+
+    def _start_locked(self) -> None:
+        self.close_locked()
+        proc = subprocess.Popen(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    line_q.put(raw.rstrip("\r\n"))
+            except Exception:
+                pass
+            finally:
+                line_q.put(None)
+
+        t = threading.Thread(target=_reader, name="AnureetPSPipeReader", daemon=True)
+        t.start()
+        self._proc = proc
+        self._line_queue = line_q
+        self._reader_thread = t
+        # Preload UIAutomation + WinRT OCR assemblies once
+        self._eval_locked(_PS_PRELOAD_SCRIPT, timeout=15.0)
+
+    def close_locked(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if self._proc.poll() is None:
+                    self._proc.kill()
+            except Exception:
+                pass
+        self._proc = None
+        self._line_queue = None
+        self._reader_thread = None
+
+    def close(self) -> None:
+        with self._lock:
+            self.close_locked()
+
+    def _eval_locked(self, ps_script: str, timeout: float) -> str:
+        assert self._proc is not None and self._proc.stdin is not None and self._line_queue is not None
+        token = uuid.uuid4().hex
+        done_marker = f"__ANUREET_PS_DONE_{token}__"
+        err_prefix = f"__ANUREET_PS_ERR_{token}__:"
+        b64 = base64.b64encode(ps_script.encode("utf-8")).decode("ascii")
+        wrapper = (
+            f"try {{ $code = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')); "
+            f"Invoke-Expression $code }} catch {{ Write-Output ('{err_prefix}' + $_.Exception.Message) }}; "
+            f"Write-Output '{done_marker}'\n"
+        )
+        self._proc.stdin.write(wrapper)
+        self._proc.stdin.flush()
+
+        lines = []
+        deadline = time.monotonic() + max(0.5, timeout)
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                self.close_locked()
+                raise subprocess.TimeoutExpired(cmd="powershell.exe", timeout=timeout)
+            try:
+                line = self._line_queue.get(timeout=rem)
+            except queue.Empty:
+                self.close_locked()
+                raise subprocess.TimeoutExpired(cmd="powershell.exe", timeout=timeout)
+            if line is None:
+                self.close_locked()
+                raise RuntimeError("Persistent PowerShell worker pipe exited unexpectedly.")
+            if line == done_marker:
+                break
+            if line.startswith(err_prefix):
+                raise RuntimeError(line[len(err_prefix):].strip())
+            if line.strip():
+                lines.append(line)
+        return "\n".join(lines).strip()
+
+    def run(self, ps_script: str, timeout: float = 10.0) -> str:
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self._start_locked()
+            try:
+                return self._eval_locked(ps_script, timeout=timeout)
+            except (BrokenPipeError, OSError):
+                self._start_locked()
+                return self._eval_locked(ps_script, timeout=timeout)
+
+
+_PS_WORKER = _PersistentPowerShellWorker()
+atexit.register(_PS_WORKER.close)
+
+
 def _run_hidden_ps(ps_script: str, timeout: int = 10) -> str:
-    encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-    res = subprocess.run(
-        ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        timeout=timeout,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if res.returncode != 0:
-        raise RuntimeError((res.stderr or res.stdout or f"PowerShell exited {res.returncode}").strip())
-    return res.stdout.strip()
+    return _PS_WORKER.run(ps_script, timeout=float(timeout))
 
 
 def _find_uia_element_center(hwnd: int, target_text: str) -> Optional[Tuple[int, int]]:
-    """Use Windows UI Automation to locate a button/link/input matching target_text inside hwnd."""
+    """Use Windows UI Automation (preloaded persistent pipe) to locate element center inside hwnd."""
     if os.name != "nt":
         return None
     escaped = target_text.replace("'", "''")
     ps = (
-        "$ErrorActionPreference = 'Stop'; "
-        "Add-Type -AssemblyName UIAutomationClient; "
-        "Add-Type -AssemblyName UIAutomationTypes; "
         f"$root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{int(hwnd)}); "
         "$cond = [System.Windows.Automation.Condition]::TrueCondition; "
         "$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond); "
@@ -428,22 +606,12 @@ def _find_ocr_text_center(hwnd: int, target_text: str) -> Optional[Tuple[int, in
         png_esc = png_path.replace("'", "''")
         needle_esc = target_text.replace("'", "''")
         ps = (
-            "$ErrorActionPreference = 'Stop'; "
-            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-            "[Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime] | Out-Null; "
-            "[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null; "
-            "[Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null; "
-            "[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null; "
-            "[Windows.Storage.FileAccessMode, Windows.Storage, ContentType=WindowsRuntime] | Out-Null; "
-            "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | "
-            "Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
-            "Function Await($op, $resType) { $t = $asTaskGeneric.MakeGenericMethod($resType).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }; "
-            f"$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{png_esc}')) ([Windows.Storage.StorageFile]); "
-            "$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]); "
-            "$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]); "
-            "$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]); "
-            "$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages(); "
-            "$ocrRes = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult]); "
+            "if (-not $script:AnureetOcrEngine) { $script:AnureetOcrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }; "
+            f"$file = Anureet-Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{png_esc}')) ([Windows.Storage.StorageFile]); "
+            "$stream = Anureet-Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]); "
+            "$decoder = Anureet-Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]); "
+            "$bitmap = Anureet-Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]); "
+            "$ocrRes = Anureet-Await ($script:AnureetOcrEngine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult]); "
             f"$needle = '{needle_esc}'.ToLower().Trim(); "
             "$tokens = @($needle -split '\\s+' | Where-Object { $_.Length -ge 2 }); "
             "$best = $null; "
@@ -485,15 +653,43 @@ def _find_ocr_text_center(hwnd: int, target_text: str) -> Optional[Tuple[int, in
     return None
 
 
-def click_screen_element(target_text: str, app_name: str = "") -> Dict[str, Any]:
+def minimize_all_windows() -> Dict[str, Any]:
+    """Minimize all open application windows and show the Windows desktop (Win + D)."""
+    try:
+        if os.name == "nt":
+            if pyautogui:
+                pyautogui.hotkey("win", "d")
+            elif hasattr(ctypes, "windll"):
+                user32 = ctypes.windll.user32
+                user32.keybd_event(0x5B, 0, 0, 0)
+                user32.keybd_event(ord("D"), 0, 0, 0)
+                user32.keybd_event(ord("D"), 0, 2, 0)
+                user32.keybd_event(0x5B, 0, 2, 0)
+            return {"status": "success", "message": "Minimized all windows and showed the desktop."}
+        return {"status": "error", "message": "Minimize all is supported on Windows only."}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to minimize windows: {e}"}
+
+
+def click_screen_element(target_text: str = "", app_name: str = "", **kwargs) -> Dict[str, Any]:
     """Locate a named button, menu, tab, or text element via Windows UIA + WinRT OCR and click it."""
     if not pyautogui:
         return {"status": "error", "message": "PyAutoGUI not installed."}
-    clean_target = re.sub(r'[.?!,;:"\']+$', "", (target_text or "").strip()).strip()
+    raw_target = (
+        target_text
+        or kwargs.get("element")
+        or kwargs.get("text")
+        or kwargs.get("target")
+        or kwargs.get("label")
+        or kwargs.get("button")
+        or ""
+    )
+    raw_app = app_name or kwargs.get("app") or kwargs.get("application") or kwargs.get("window") or ""
+    clean_target = re.sub(r'[.?!,;:"\']+$', "", str(raw_target).strip()).strip()
     if not clean_target:
         return {"status": "error", "message": "Specify which on-screen button or text to click."}
 
-    hwnd, win_title, err = _get_target_hwnd(app_name)
+    hwnd, win_title, err = _get_target_hwnd(str(raw_app))
     if hwnd is None:
         return {"status": "error", "message": err}
 
@@ -521,12 +717,14 @@ def click_screen_element(target_text: str, app_name: str = "") -> Dict[str, Any]
     }
 
 
-def browser_tab_action(action: str, target: str = "") -> str:
+def browser_tab_action(action: str = "next", target: str = "", **kwargs) -> str:
     """Switch, open, or close tabs in Google Chrome / Edge cleanly."""
     if not pyautogui:
         return "PyAutoGUI not installed."
-    act = (action or "").lower().strip()
-    clean_target = re.sub(r'[.?!,;:"\']+$', "", (target or "").strip()).strip()
+    raw_act = action or kwargs.get("act") or kwargs.get("action_type") or kwargs.get("command") or "next"
+    raw_target = target or kwargs.get("tab") or kwargs.get("tab_name") or kwargs.get("title") or ""
+    act = str(raw_act).lower().strip() or "next"
+    clean_target = re.sub(r'[.?!,;:"\']+$', "", str(raw_target).strip()).strip()
 
     focus_res = focus_window("Chrome")
     if focus_res.get("status") != "success":

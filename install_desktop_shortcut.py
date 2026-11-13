@@ -95,7 +95,7 @@ def create_desktop_shortcut(shortcut_name: str = "Anureet AI.lnk", desktop_dir: 
         f"$Shortcut.WorkingDirectory = '{_ps_escape(PROJECT_ROOT)}'; "
         f"$Shortcut.IconLocation = '{_ps_escape(ico_path)},0'; "
         "$Shortcut.Description = 'Launch Anureet AI (Ollama + Gateway + Animated Widget)'; "
-        "$Shortcut.WindowStyle = 7; "
+        "$Shortcut.WindowStyle = 1; "
         "$Shortcut.Save()"
     )
     encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")

@@ -9,6 +9,10 @@ let recognition = null;
 let ttsEnabled = true;
 let cachedVoices = [];
 
+let currentTtsAudio = null;
+let lastSeenUserText = '';
+let lastSeenAgentText = '';
+
 document.addEventListener('DOMContentLoaded', () => {
   initTabs();
   initChatControls();
@@ -16,6 +20,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initSpeechSynthesis();
   initSpeechRecognition();
   initWebSocket();
+  loadChatHistory();
 });
 
 // Tabs (ARIA selection by activation + Left/Right keyboard navigation)
@@ -82,8 +87,8 @@ function initChatControls() {
   const ttsBtn = document.getElementById('tts-btn');
   ttsBtn.addEventListener('click', () => {
     ttsEnabled = !ttsEnabled;
-    if (!ttsEnabled && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+    if (!ttsEnabled) {
+      stopSpeaking();
     }
     ttsBtn.setAttribute('aria-pressed', String(ttsEnabled));
     ttsBtn.setAttribute('aria-label', ttsEnabled ? 'Mute voice responses' : 'Unmute voice responses');
@@ -91,8 +96,8 @@ function initChatControls() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+    if (e.key === 'Escape') {
+      stopSpeaking();
     }
   });
 }
@@ -175,6 +180,62 @@ function handleServerMessage(data) {
   } else if (data.type === 'reminder' && data.message) {
     appendAgentMessage(`⏰ ${data.message}`);
     speakResponse(data.message);
+  } else if (data.type === 'external_event' && data.event) {
+    handleExternalEvent(data.event);
+  }
+}
+
+function handleExternalEvent(ev) {
+  if (!ev) return;
+  const source = ev.source || 'voice';
+  if (source === 'web') return;
+
+  const state = ev.state || 'idle';
+  const userText = (ev.user_text || '').trim();
+  const agentText = (ev.agent_text || '').trim();
+  const sourceLabel = source === 'widget' ? 'Widget' : (source === 'voice' ? 'Voice' : source);
+
+  if (state === 'thinking') {
+    updateTypingIndicator(true, `Anureet is thinking (${sourceLabel})...`);
+    if (userText && userText !== lastSeenUserText) {
+      lastSeenUserText = userText;
+      appendUserMessage(userText, sourceLabel);
+    }
+  } else if (state === 'speaking' || state === 'idle') {
+    updateTypingIndicator(false);
+    if (userText && userText !== lastSeenUserText) {
+      lastSeenUserText = userText;
+      appendUserMessage(userText, sourceLabel);
+    }
+    if (agentText && agentText !== lastSeenAgentText) {
+      lastSeenAgentText = agentText;
+      appendAgentMessage(agentText);
+    }
+  }
+}
+
+async function loadChatHistory() {
+  try {
+    const res = await fetch('/api/history?limit=30');
+    if (!res.ok) return;
+    const data = await res.json();
+    const history = data.history || [];
+    if (!Array.isArray(history) || history.length === 0) return;
+
+    const chatBox = document.getElementById('chat-box');
+    chatBox.innerHTML = '';
+    for (const turn of history) {
+      if (turn.role === 'user') {
+        const src = turn.source === 'web' ? '' : (turn.source === 'widget' ? 'Widget' : (turn.source === 'voice' ? 'Voice' : ''));
+        appendUserMessage(turn.content, src);
+        lastSeenUserText = turn.content;
+      } else if (turn.role === 'assistant') {
+        appendAgentMessage(turn.content);
+        lastSeenAgentText = turn.content;
+      }
+    }
+  } catch (e) {
+    console.debug('History load skipped:', e);
   }
 }
 
@@ -261,36 +322,79 @@ function initSpeechSynthesis() {
   window.speechSynthesis.addEventListener('voiceschanged', refreshVoices);
 }
 
-function speakResponse(text) {
-  if (!ttsEnabled || !text || !('speechSynthesis' in window)) return;
+function stopSpeaking() {
+  if (currentTtsAudio) {
+    try {
+      currentTtsAudio.pause();
+      currentTtsAudio.currentTime = 0;
+    } catch (e) {}
+    currentTtsAudio = null;
+  }
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+}
 
-  window.speechSynthesis.cancel();
+async function speakResponse(text) {
+  if (!ttsEnabled || !text) return;
+  stopSpeaking();
 
   const cleanText = String(text)
     .replace(/\*\*/g, '')
-    .replace(/```[\s\S]*?```/g, 'Code output complete.');
+    .replace(/```[\s\S]*?```/g, 'Code output complete.')
+    .trim();
+  if (!cleanText) return;
+
+  // 1. Preferred: High-fidelity offline Microsoft Heera (Indian Female) WAV via server
+  try {
+    const audioUrl = `/api/tts?text=${encodeURIComponent(cleanText.slice(0, 600))}`;
+    const audio = new Audio(audioUrl);
+    currentTtsAudio = audio;
+    const playPromise = audio.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {
+        _speakWithBrowserFallback(cleanText);
+      });
+    }
+    return;
+  } catch (e) {
+    _speakWithBrowserFallback(cleanText);
+  }
+}
+
+function _speakWithBrowserFallback(cleanText) {
+  if (!('speechSynthesis' in window)) return;
   const utterance = new SpeechSynthesisUtterance(cleanText);
   utterance.rate = 1.0;
-  utterance.pitch = 1.0;
+  utterance.pitch = 1.05;
 
   const voices = cachedVoices.length ? cachedVoices : window.speechSynthesis.getVoices();
   const hasDevanagari = /[\u0900-\u097F]/.test(cleanText);
-  const preferredVoice = hasDevanagari
-    ? voices.find((v) => v.lang.includes('hi-IN') || v.name.includes('Hindi'))
-    : voices.find(
-        (v) =>
-          v.lang.includes('en-IN') ||
-          v.name.includes('India') ||
-          v.name.includes('Zira') ||
-          v.name.includes('Google UK English Female')
-      );
-  if (preferredVoice) {
-    utterance.voice = preferredVoice;
-    utterance.lang = preferredVoice.lang;
+
+  // Reject known male voices strictly
+  const isFemale = (v) => {
+    const name = (v.name || '').toLowerCase();
+    return !['ravi', 'hemant', 'david', 'mark', 'george', 'male', 'guy', 'cosmo'].some((m) => name.includes(m));
+  };
+
+  let chosen = null;
+  if (hasDevanagari) {
+    chosen =
+      voices.find((v) => isFemale(v) && (v.name.includes('Kalpana') || v.name.includes('Swara') || v.lang.includes('hi-IN'))) ||
+      voices.find((v) => v.lang.includes('hi-IN'));
+  } else {
+    chosen =
+      voices.find((v) => isFemale(v) && /heera|kalpana|neerja|aditi/i.test(v.name)) ||
+      voices.find((v) => isFemale(v) && (v.lang.includes('en-IN') || v.name.includes('India'))) ||
+      voices.find((v) => isFemale(v) && (v.name.includes('Zira') || v.name.includes('Female')));
+  }
+
+  if (chosen) {
+    utterance.voice = chosen;
+    utterance.lang = chosen.lang;
   } else {
     utterance.lang = hasDevanagari ? 'hi-IN' : 'en-IN';
   }
-
   window.speechSynthesis.speak(utterance);
 }
 
@@ -347,13 +451,24 @@ function scrollChatToBottom() {
   });
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, sourceLabel = '') {
   const chatBox = document.getElementById('chat-box');
   const msgDiv = document.createElement('div');
   msgDiv.className = 'message user';
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = text;
+  if (sourceLabel) {
+    const badge = document.createElement('small');
+    badge.style.display = 'block';
+    badge.style.opacity = '0.75';
+    badge.style.fontSize = '0.72rem';
+    badge.style.marginBottom = '3px';
+    badge.textContent = `[${sourceLabel}]`;
+    bubble.appendChild(badge);
+  }
+  const span = document.createElement('span');
+  span.textContent = text;
+  bubble.appendChild(span);
   msgDiv.appendChild(bubble);
   chatBox.appendChild(msgDiv);
   scrollChatToBottom();

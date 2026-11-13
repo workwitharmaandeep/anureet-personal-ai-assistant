@@ -1,3 +1,14 @@
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
+os.environ["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
+os.environ["OLLAMA_NUM_PARALLEL"] = "1"
+os.environ["OLLAMA_NOPRUNE"] = "1"
+
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -18,12 +29,18 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent_core import agent
 from config import config
+from tools.memory_store import (
+    get_synced_history,
+    get_latest_widget_events,
+    get_widget_head_id,
+)
+from voice_assistant import AnureetVoiceEngine
 
 logger = logging.getLogger("GatewayServer")
 
@@ -58,17 +75,46 @@ async def _reminder_watchdog_loop():
             logger.debug(f"Reminder watchdog iteration skipped: {e}")
 
 
+async def _widget_event_broadcast_loop():
+    """Broadcast cross-process widget/voice turns to connected Web UI WebSocket clients."""
+    last_id = await asyncio.to_thread(get_widget_head_id)
+    while True:
+        try:
+            await asyncio.sleep(0.35)
+            if not manager.active_connections:
+                # Still advance head so reconnects rely on /api/history
+                events = await asyncio.to_thread(get_latest_widget_events, last_id)
+                for ev in events:
+                    last_id = max(last_id, int(ev.get("id", 0)))
+                continue
+
+            events = await asyncio.to_thread(get_latest_widget_events, last_id)
+            for ev in events:
+                last_id = max(last_id, int(ev.get("id", 0)))
+                await manager.broadcast({
+                    "type": "external_event",
+                    "event": ev,
+                })
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Widget event broadcast skipped: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    task = asyncio.create_task(_reminder_watchdog_loop())
+    task_rem = asyncio.create_task(_reminder_watchdog_loop())
+    task_ev = asyncio.create_task(_widget_event_broadcast_loop())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        task_rem.cancel()
+        task_ev.cancel()
+        for t in (task_rem, task_ev):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Local AI Agent Gateway", version="1.2.0", lifespan=lifespan)
@@ -122,7 +168,46 @@ async def api_chat(req: ChatRequest):
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    return await asyncio.to_thread(agent.process_query, query)
+    return await asyncio.to_thread(agent.process_query, query, None, "web")
+
+
+@app.get("/api/history")
+async def api_get_history(limit: int = Query(40, ge=1, le=100)):
+    history = await asyncio.to_thread(get_synced_history, limit)
+    return {"status": "success", "history": history}
+
+
+@app.get("/api/events")
+async def api_get_events(after_id: int = Query(0, ge=0)):
+    events = await asyncio.to_thread(get_latest_widget_events, after_id)
+    head_id = await asyncio.to_thread(get_widget_head_id)
+    return {"status": "success", "events": events, "head_id": head_id}
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+async def api_tts_post(req: TTSRequest):
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    wav_bytes = await asyncio.to_thread(AnureetVoiceEngine.synthesize_offline_female_wav, text)
+    if not wav_bytes:
+        raise HTTPException(status_code=500, detail="TTS synthesis failed.")
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.get("/api/tts")
+async def api_tts_get(text: str = Query(...)):
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Text parameter cannot be empty.")
+    wav_bytes = await asyncio.to_thread(AnureetVoiceEngine.synthesize_offline_female_wav, cleaned)
+    if not wav_bytes:
+        raise HTTPException(status_code=500, detail="TTS synthesis failed.")
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 # File Manager REST APIs
@@ -286,7 +371,7 @@ async def websocket_chat(websocket: WebSocket):
                 "message": f"Processing query: '{query}'",
             })
 
-            res = await asyncio.to_thread(agent.process_query, query, thread_log_callback)
+            res = await asyncio.to_thread(agent.process_query, query, thread_log_callback, "web")
 
             await manager.send_json(websocket, {
                 "type": "response",

@@ -268,10 +268,19 @@ def list_installed_apps(query: str = "", limit: int = 25) -> Dict[str, Any]:
 
 def _launch_single_application(app_name: str) -> str:
     """Launch a single application, website, UWP/Store app, or Start Menu app on Windows."""
-    app_key = (app_name or "").lower().strip()
+    raw_name = (app_name or "").strip(" .?!,;:\"'")
+    if not raw_name.lower().endswith(".exe"):
+        try:
+            from tools.query_normalizer import resolve_app_name
+            resolved_app = resolve_app_name(raw_name)
+            if resolved_app:
+                raw_name = resolved_app
+        except Exception:
+            pass
+    app_key = raw_name.lower()
     if not app_key:
         return "Specify which application to open."
-    logger.info(f"Physically launching application: '{app_name}'")
+    logger.info(f"Physically launching application: '{raw_name}'")
 
     if "youtube" in app_key:
         webbrowser.open("https://www.youtube.com")
@@ -442,6 +451,14 @@ def _find_running_app_pids(app_query: str) -> List[tuple[int, str, str]]:
 def close_application(app_name: str) -> str:
     """Close a running application physically on Windows using known aliases or live window/process discovery."""
     raw_name = (app_name or "").strip(" .?!,;:\"'")
+    if not raw_name.lower().endswith(".exe"):
+        try:
+            from tools.query_normalizer import resolve_app_name
+            resolved_app = resolve_app_name(raw_name)
+            if resolved_app:
+                raw_name = resolved_app
+        except Exception:
+            pass
     app_key = raw_name.lower()
     if not app_key:
         return "Specify which application to close."
@@ -573,6 +590,31 @@ def open_website_or_search(query_or_url: str) -> str:
         return f"Opened {url} in Google Chrome."
     except Exception as e:
         return f"Failed to open browser: {e}"
+
+
+def open_website(url: str) -> str:
+    """Navigate Chrome directly to an exact URL (no Google search fallback).
+
+    Args:
+        url: The full URL to open (e.g. 'https://unstop.com/hackathons/voyaghack').
+             If the scheme is missing, https:// is prepended automatically.
+
+    Returns:
+        Status string confirming the browser was opened.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return "No URL provided. Please specify a URL to open."
+    if raw.startswith("www."):
+        raw = "https://" + raw
+    elif not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    try:
+        webbrowser.open(raw)
+        _record_opened_app("chrome")
+        return f"Opened {raw} in Chrome."
+    except Exception as e:
+        return f"Failed to open browser for '{raw}': {e}"
 
 
 def write_to_notepad(text: str, filename: str = "meeting_notes.txt") -> str:

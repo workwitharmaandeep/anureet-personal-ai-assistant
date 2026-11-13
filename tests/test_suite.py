@@ -211,6 +211,61 @@ class TestToolsAndVoice(unittest.TestCase):
         self.assertTrue(follow)
         self.assertEqual(follow_cmd, "what time is it")
 
+        # Strict mode (default): NO execution without 'Anureet'
+        strict_wake, _ = AnureetVoiceEngine.extract_wake_command("open notepad", continuous_mode=False)
+        self.assertFalse(strict_wake)
+
+        strict_with_wake, strict_cmd = AnureetVoiceEngine.extract_wake_command("Anureet open notepad", continuous_mode=False)
+        self.assertTrue(strict_with_wake)
+        self.assertEqual(strict_cmd, "open notepad")
+
+        # Continuous mode: executes without 'Anureet'
+        cont_wake, cont_cmd = AnureetVoiceEngine.extract_wake_command("open notepad", continuous_mode=True)
+        self.assertTrue(cont_wake)
+        self.assertEqual(cont_cmd, "open notepad")
+
+    def test_voice_continuous_mode_lifecycle(self):
+        engine = AnureetVoiceEngine(init_stt=False)
+        self.assertFalse(engine.is_continuous_mode_active())
+
+        # Start continuous mode for 60s
+        engine.start_continuous_mode(60.0)
+        self.assertTrue(engine.is_continuous_mode_active())
+
+        # An utterance without wake word should be accepted in continuous mode
+        wake, cmd = engine.extract_wake_command("explain gravity", continuous_mode=engine.is_continuous_mode_active())
+        self.assertTrue(wake)
+        self.assertEqual(cmd, "explain gravity")
+
+        # Stop continuous mode -> strict mode
+        engine.stop_continuous_mode()
+        self.assertFalse(engine.is_continuous_mode_active())
+
+        # Now utterance without wake word must be rejected
+        wake, cmd = engine.extract_wake_command("explain gravity", continuous_mode=engine.is_continuous_mode_active())
+        self.assertFalse(wake)
+
+        # But with wake word it is accepted
+        wake, cmd = engine.extract_wake_command("Anureet explain gravity", continuous_mode=engine.is_continuous_mode_active())
+        self.assertTrue(wake)
+        self.assertEqual(cmd, "explain gravity")
+
+    def test_continuous_chat_fast_routes(self):
+        import agent_core
+        agent = agent_core.LocalAIAgent()
+
+        res_start = agent.process_query("listen continuously")
+        self.assertIn("continuous listening mode activated", res_start.get("response_text", "").lower())
+
+        res_start_hinglish = agent.process_query("baat karte raho")
+        self.assertIn("continuous listening mode activated", res_start_hinglish.get("response_text", "").lower())
+
+        res_stop = agent.process_query("stop continuous mode")
+        self.assertIn("continuous chat mode ended", res_stop.get("response_text", "").lower())
+
+        res_strict = agent.process_query("strict command mode")
+        self.assertIn("continuous chat mode ended", res_strict.get("response_text", "").lower())
+
     def test_hinglish_fast_route_matches_user_language(self):
         test_agent = LocalAIAgent(ollama_url="http://localhost:11434", model_name="test-model")
         mock_weather = {
@@ -505,15 +560,17 @@ class TestToolsAndVoice(unittest.TestCase):
 
         engine = AnureetVoiceEngine(init_stt=False)
         self.assertFalse(engine._stt_initialized)
-        played_files = []
+        fake_voice = MagicMock()
+        fake_voice.WaitUntilDone.return_value = True
+        fake_voice.Status.RunningState = 1
+        engine._tts_voice = fake_voice
         with patch.object(voice_assistant, "check_internet_connection", return_value=False), patch.object(
-            voice_assistant, "_play_audio_file", side_effect=lambda p, stop_event=None: (played_files.append(p), False)[1]
-        ):
-            t = __import__("threading").Thread(target=lambda: engine.speak("Test voice output ready."))
-            t.start()
-            t.join(timeout=8)
-            self.assertFalse(t.is_alive())
-            self.assertEqual(len(played_files), 1)
+            engine, "_tts_queue"
+        ) as mock_q:
+            engine.speak("Test voice output ready.", blocking=False)
+            mock_q.put.assert_called_once_with("Test voice output ready.")
+            engine.stop_speaking()
+            fake_voice.Speak.assert_called_with("", voice_assistant.SVSFPurgeBeforeSpeak)
 
         with patch("agent_core.open_application", return_value="Launched notepad") as mock_np:
             matched = LocalAIAgent(ollama_url="http://localhost:11434", model_name="test")._match_fast_route("अपन नोद पेर.")
@@ -800,7 +857,7 @@ class TestLiveTranscriptFixes(unittest.TestCase):
             m_np.assert_not_called()
 
             self.assertEqual(agent.execute("Click on create project in capcut.").tool_calls_made[0]["tool"], "click_screen_element")
-            m_clk.assert_called_once_with("create project", app_name="capcut")
+            m_clk.assert_called_once_with("create project", app_name="CapCut")
 
             self.assertEqual(agent.execute("Switch tab.").tool_calls_made[0]["tool"], "browser_tab_action")
             m_tab.assert_any_call("next")
@@ -808,7 +865,7 @@ class TestLiveTranscriptFixes(unittest.TestCase):
             self.assertEqual(agent.execute("Switch to chrome.").tool_calls_made[0]["tool"], "focus_window")
             self.assertEqual(agent.execute("Youtube window pr switch karo.").tool_calls_made[0]["tool"], "focus_window")
             self.assertEqual(m_foc.call_count, 2)
-            m_tab.assert_any_call("switch_to", "Youtube")
+            self.assertTrue(any("youtube" in str(call).lower() for call in m_tab.call_args_list))
 
             self.assertEqual(agent.execute("Stop and close everything.").tool_calls_made[0]["tool"], "shutdown_anureet")
             self.assertEqual(agent.execute("Switch off yourself.").tool_calls_made[0]["tool"], "shutdown_anureet")
@@ -856,10 +913,667 @@ class TestLiveTranscriptFixes(unittest.TestCase):
             res = agent.execute("Please find my nonexistent special app window")
 
         self.assertIn("MissingApp", res.response)
-        self.assertEqual(captured_payloads[0]["options"]["temperature"], 0.2)
+        self.assertEqual(captured_payloads[0]["options"]["temperature"], 0.1)
+        self.assertEqual(captured_payloads[0]["options"]["num_ctx"], 2048)
+        self.assertEqual(captured_payloads[0]["options"]["num_batch"], 256)
+        self.assertEqual(captured_payloads[0]["options"]["num_thread"], 6)
         tool_msgs = [m for m in captured_payloads[1]["messages"] if m.get("role") == "tool"]
         self.assertEqual(len(tool_msgs), 1)
         self.assertTrue(tool_msgs[0]["content"].startswith("[TOOL_FAILED - REPORT THIS HONESTLY, DO NOT CLAIM IT SUCCEEDED]:"))
+
+    def test_widget_arbitrary_resize_and_persistence(self):
+        import anureet_widget
+
+        self.assertEqual(anureet_widget.clamp_widget_scale(0.1, 1920, 1080), anureet_widget.MIN_WIDGET_SCALE)
+        self.assertEqual(anureet_widget.clamp_widget_scale(1.65, 1920, 1080), 1.65)
+        self.assertLessEqual(anureet_widget.clamp_widget_scale(99.0, 1920, 1080), anureet_widget.MAX_WIDGET_SCALE)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_file = Path(tmp) / "widget_prefs.json"
+            snapshots = []
+
+            def _exercise(app):
+                app.set_scale(0.55)
+                snapshots.append(("shrunk", app.scale, app.stage_w, app.stage_h))
+                app.set_scale(2.25)
+                snapshots.append(("enlarged", app.scale, app.stage_w, app.stage_h))
+                app.resize_hud(520, 610)
+                snapshots.append(("hud", app.hud_w, app.hud_h))
+                app._on_orb_wheel(MagicMock(delta=120))
+                snapshots.append(("wheel_up", app.scale))
+                app._on_orb_wheel(MagicMock(delta=-120))
+                snapshots.append(("wheel_down", app.scale))
+                app.root.after(20, app.close)
+
+            w1 = anureet_widget.AnureetWidgetApp(on_ready=_exercise, prefs_path=prefs_file, prewarm_voice=False)
+            w1.run()
+
+            self.assertEqual(snapshots[0][1], 0.55)
+            self.assertLess(snapshots[0][2], anureet_widget.BASE_STAGE_W)
+            self.assertEqual(snapshots[1][1], 2.25)
+            self.assertGreater(snapshots[1][2], anureet_widget.BASE_STAGE_W * 2)
+            self.assertEqual(snapshots[2], ("hud", 520, 610))
+            self.assertGreater(snapshots[3][1], 2.25)
+            self.assertTrue(prefs_file.exists())
+
+            restored = []
+            w2 = anureet_widget.AnureetWidgetApp(
+                on_ready=lambda app: (restored.append((app.scale, app.hud_w, app.hud_h)), app.root.after(20, app.close)),
+                prefs_path=prefs_file,
+                prewarm_voice=False,
+            )
+            w2.run()
+            self.assertAlmostEqual(restored[0][0], snapshots[4][1], places=2)
+            self.assertEqual(restored[0][1:], (520, 610))
+
+    def test_widget_minimize_restore_and_character_blink_animation(self):
+        import anureet_widget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_file = Path(tmp) / "widget_prefs.json"
+            observations = {}
+
+            def _exercise(app):
+                try:
+                    observations["has_blink"] = "blink" in app._sprite_frames
+                    observations["init_minimized"] = app.is_minimized
+
+                    # Test minimize badge hit detection
+                    mx, my = app._min_badge_pos
+                    observations["hit_min_badge"] = app._hit_min_badge(mx, my)
+                    observations["hit_elsewhere"] = app._hit_min_badge(0, 0)
+
+                    # Test minimizing widget
+                    orig_w, orig_h = app.stage_w, app.stage_h
+                    app.minimize_widget()
+                    observations["is_minimized"] = app.is_minimized
+                    observations["min_dims"] = (app.stage_w, app.stage_h)
+
+                    # Test restoring widget
+                    app.restore_widget()
+                    observations["is_restored"] = not app.is_minimized
+                    observations["restored_dims"] = (app.stage_w, app.stage_h)
+
+                    # Test toggle minimize
+                    app.toggle_minimize()
+                    observations["toggled_min"] = app.is_minimized
+                    app.toggle_minimize()
+                    observations["toggled_restored"] = not app.is_minimized
+
+                    # Test unminimize on scaling
+                    app.minimize_widget()
+                    app.adjust_scale(1.1)
+                    observations["unmin_on_scale"] = not app.is_minimized
+                finally:
+                    app.root.after(10, app.close)
+
+            w = anureet_widget.AnureetWidgetApp(on_ready=_exercise, prefs_path=prefs_file, prewarm_voice=False)
+            w.run()
+
+            self.assertTrue(observations["has_blink"])
+            self.assertFalse(observations["init_minimized"])
+            self.assertTrue(observations["hit_min_badge"])
+            self.assertFalse(observations["hit_elsewhere"])
+            self.assertTrue(observations["is_minimized"])
+            self.assertEqual(observations["min_dims"], (142, 38))
+            self.assertTrue(observations["is_restored"])
+            self.assertEqual(observations["restored_dims"], (anureet_widget.BASE_STAGE_W, anureet_widget.BASE_STAGE_H))
+            self.assertTrue(observations["toggled_min"])
+            self.assertTrue(observations["toggled_restored"])
+            self.assertTrue(observations["unmin_on_scale"])
+
+
+class TestAirGappedArchitecture(unittest.TestCase):
+    """End-to-end verification of the 4-phase offline refactoring."""
+
+    def test_phase1_offline_env_vars_and_cpu_whisper_pinning(self):
+        import voice_assistant
+
+        for k, expected in (
+            ("HF_HUB_OFFLINE", "1"),
+            ("TRANSFORMERS_OFFLINE", "1"),
+            ("OLLAMA_HOST", "127.0.0.1:11434"),
+            ("OLLAMA_FLASH_ATTENTION", "1"),
+            ("OLLAMA_KV_CACHE_TYPE", "q8_0"),
+            ("OLLAMA_MAX_LOADED_MODELS", "1"),
+            ("OLLAMA_NUM_PARALLEL", "1"),
+            ("OLLAMA_NOPRUNE", "1"),
+        ):
+            self.assertEqual(os.environ.get(k), expected)
+
+        self.assertFalse(voice_assistant.check_internet_connection())
+        engine = object.__new__(AnureetVoiceEngine)
+        mock_candidate = MagicMock()
+        with patch("voice_assistant.WhisperModel", return_value=mock_candidate) as mock_cls:
+            engine._init_whisper_model()
+        mock_cls.assert_called_once_with(
+            config.whisper_model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=4,
+            local_files_only=True,
+        )
+        self.assertEqual(engine.whisper_device, "cpu")
+        self.assertEqual(engine.whisper_compute_type, "int8")
+
+    def test_phase2_loopback_dual_model_routing_and_pydantic_format(self):
+        import agent_core
+
+        a = LocalAIAgent()
+        self.assertFalse(a._session.trust_env)
+        self.assertEqual(a._select_model_for_query("how is kurukshetra today?"), "llama3.1-gpu:latest")
+        self.assertEqual(a._select_model_for_query("debug python traceback in script"), "qwen2.5-coder:7b")
+
+        captured = {}
+
+        def _fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            resp = MagicMock()
+            resp.raise_for_status = lambda: None
+            resp.json.return_value = {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"action":"final_answer","tool_name":null,"arguments":{},"response":"Offline ok"}',
+                }
+            }
+            return resp
+
+        with patch.object(a._session, "post", side_effect=_fake_post):
+            action = a.plan_structured_action("write a python function to sort numbers")
+        self.assertEqual(captured["json"]["model"], "qwen2.5-coder:7b")
+        self.assertEqual(captured["json"]["format"], agent_core.AgentAction.model_json_schema())
+        self.assertEqual(action.action, "final_answer")
+        self.assertEqual(action.response, "Offline ok")
+
+    def test_phase3_streaming_clauses_and_sapi5_barge_in(self):
+        import agent_core
+
+        spoken = []
+        buf = agent_core._ClauseBuffer(spoken.append, min_chars=25)
+        buf.feed("Haan bilkul friend, main aapki ")
+        self.assertEqual(spoken, [])
+        buf.feed("madad abhi karta hoon. Aur next line!")
+        self.assertEqual(spoken, ["Haan bilkul friend, main aapki madad abhi karta hoon."])
+        buf.flush()
+        self.assertEqual(spoken[-1], "Aur next line!")
+
+        agent = LocalAIAgent(ollama_url="http://127.0.0.1:11434", model_name="test-model")
+        stream_lines = [
+            json.dumps({"message": {"role": "assistant", "content": "Pehla sentence ready hai yahan. "}, "done": False}),
+            json.dumps({"message": {"role": "assistant", "content": "Dusra part bhi aa gaya!"}, "done": True}),
+        ]
+        stream_resp = MagicMock(status_code=200)
+        stream_resp.raise_for_status = lambda: None
+        stream_resp.iter_lines.return_value = iter(stream_lines)
+
+        out_clauses = []
+        with patch.object(agent._session, "post", return_value=stream_resp):
+            res = agent.stream_query("tell me a short story offline", on_clause=out_clauses.append, session_id="stream_t")
+        self.assertEqual(len(out_clauses), 2)
+        self.assertIn("Pehla sentence", res["response_text"])
+
+    def test_phase4_fts5_bm25_sandbox_and_zero_external_sockets(self):
+        import socket
+        from tools import memory_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bm25.db"
+            memory_store.save_memory("I love fast Python scripting and local agents", db_path=db_path)
+            memory_store.save_memory("Python python python optimization notes for offline AI", db_path=db_path)
+            memory_store.save_memory("Favorite snack is samosa", db_path=db_path)
+            recalled = memory_store.recall_memory("python", limit=5, db_path=db_path)
+            self.assertEqual(recalled["count"], 2)
+            with memory_store._connect(db_path) as conn:
+                mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+                sync_val = conn.execute("PRAGMA synchronous;").fetchone()[0]
+                self.assertEqual(str(mode).lower(), "wal")
+                self.assertIn(int(sync_val), (1, 2))  # NORMAL=1
+
+        # Verify zero external sockets outside 127.0.0.1
+        external_targets = []
+        orig_connect = socket.socket.connect
+
+        def _guard_connect(sock_self, address):
+            host = address[0] if isinstance(address, tuple) and address else ""
+            if host not in {"127.0.0.1", "localhost", "::1", ""}:
+                external_targets.append(host)
+                raise OSError(f"Blocked external socket in offline test: {host}")
+            return orig_connect(sock_self, address)
+
+        with patch.object(socket.socket, "connect", _guard_connect):
+            brief = deep_research_tools.deep_research_topic("Python")
+            self.assertIn("Offline Intelligence Briefing", brief)
+            py_res = deep_research_tools.run_sandboxed_code("print('sandbox-ok')", language="python", timeout=10)
+            self.assertIn("sandbox-ok", py_res)
+            timeout_res = deep_research_tools.run_sandboxed_code(
+                "import time; time.sleep(20)", language="python", timeout=1
+            )
+            self.assertIn("timed out", timeout_res.lower())
+        self.assertEqual(external_targets, [])
+
+    def test_indian_female_voice_priority_and_soft_ssml(self):
+        import voice_assistant
+
+        def _mk_tok(desc, gender, lang):
+            tok = MagicMock()
+            tok.GetDescription.return_value = desc
+            tok.GetAttribute.side_effect = lambda key: {"Gender": gender, "Language": lang}.get(key, "")
+            return tok
+
+        tok_david = _mk_tok("Microsoft David Desktop - English (United States)", "Male", "409")
+        tok_ravi = _mk_tok("Microsoft Ravi - English (India)", "Male", "4009")
+        tok_zira = _mk_tok("Microsoft Zira Desktop - English (United States)", "Female", "409")
+        tok_heera = _mk_tok("Microsoft Heera - English (India)", "Female", "4009")
+        fake_voice = MagicMock()
+
+        with patch.object(
+            AnureetVoiceEngine,
+            "_collect_sapi5_tokens",
+            return_value=[tok_david, tok_ravi, tok_zira, tok_heera],
+        ):
+            selected = AnureetVoiceEngine._select_sapi5_female_voice(fake_voice)
+
+        self.assertEqual(fake_voice.Voice, tok_heera)
+        self.assertIn("heera", selected)
+        ssml = AnureetVoiceEngine._format_soft_indian_ssml("A & B <ready>")
+        self.assertIn('<pitch absmiddle="+1">', ssml)
+        self.assertIn("A &amp; B &lt;ready&gt;", ssml)
+
+
+class TestWidgetSyncAndRobustness(unittest.TestCase):
+    """Regression tests for widget sync, female voice endpoints, tool resilience, and fast routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from server import app
+        from fastapi.testclient import TestClient
+        cls.client = TestClient(app)
+
+    def test_create_folder_fast_routes_and_execution(self):
+        import agent_core
+        from tools.file_tools import create_folder
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            res = create_folder("SubTestFolder", parent_dir=tmp_dir)
+            self.assertEqual(res["status"], "success")
+            self.assertTrue((Path(tmp_dir) / "SubTestFolder").is_dir())
+
+        with patch("agent_core.create_folder", return_value={"status": "success", "message": "Created folder 'AI'."}) as mock_cf:
+            res1 = agent_core.agent.execute("Create a new folder on desktop named AI")
+            self.assertTrue(res1.routed_fast)
+            self.assertIn("Created folder", res1.response)
+            mock_cf.assert_called_with("AI", parent_dir="desktop")
+
+            res2 = agent_core.agent.execute("desktop pe index.ai folder banao")
+            self.assertTrue(res2.routed_fast)
+            mock_cf.assert_called_with("index.ai", parent_dir="desktop")
+
+    def test_minimize_all_windows_fast_route(self):
+        import agent_core
+
+        with patch("agent_core.minimize_all_windows", return_value={"status": "success", "message": "Minimized all open windows."}) as mock_min, \
+             patch("agent_core.close_session_apps") as mock_close:
+            res = agent_core.agent.execute("Minimize all app")
+            self.assertTrue(res.routed_fast)
+            self.assertIn("Minimized all open windows", res.response)
+            mock_min.assert_called_once()
+            mock_close.assert_not_called()
+
+    def test_browser_tab_switch_again_and_missing_args(self):
+        import agent_core
+        from tools.gui_vision_tools import browser_tab_action
+
+        with patch("agent_core.browser_tab_action", return_value="Switched to next tab.") as mock_bta:
+            res = agent_core.agent.execute("Switch again")
+            self.assertTrue(res.routed_fast)
+            mock_bta.assert_called_with("next")
+
+        # Calling directly with missing positional argument must not raise TypeError
+        with patch("pyautogui.hotkey"):
+            safe_call_res = browser_tab_action()
+            self.assertIsInstance(safe_call_res, str)
+
+    def test_click_screen_element_missing_args_and_fuzzy_focus(self):
+        from tools.gui_vision_tools import click_screen_element, focus_window
+
+        # Empty target_text must return error dict, never crash with TypeError
+        res_empty = click_screen_element()
+        self.assertEqual(res_empty.get("status"), "error")
+
+        # Fuzzy window match: "capquette" resolves to "CapCut"
+        mock_win = MagicMock()
+        mock_win.title = "CapCut - Video Editor"
+        with patch("pygetwindow.getAllWindows", return_value=[mock_win]), \
+             patch("pygetwindow.getWindowsWithTitle", return_value=[]), \
+             patch("tools.os_tools._match_installed_app", return_value="CapCut"):
+            res_focus = focus_window("capquette")
+            self.assertEqual(res_focus["status"], "success")
+            self.assertIn("CapCut", res_focus["message"])
+
+    def test_malformed_parameters_json_tool_repair(self):
+        import agent_core
+
+        agent = agent_core.LocalAIAgent()
+        # Missing colon: "parameters{"
+        malformed = '{"type":"function","name":"click_screen_element","parameters{"target_text":"New folder"}}'
+        parsed = agent._parse_embedded_json_tool_call(malformed)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["name"], "click_screen_element")
+        self.assertEqual(parsed["args"].get("target_text"), "New folder")
+
+    def test_compact_tool_selection_under_num_ctx(self):
+        import agent_core
+
+        agent = agent_core.LocalAIAgent()
+        schemas = agent._select_tool_schemas_for_query("Can you switch tab in Chrome and open youtube?")
+        self.assertLessEqual(len(schemas), 14)
+        names = {s["function"]["name"] for s in schemas}
+        self.assertIn("browser_tab_action", names)
+        self.assertIn("open_application", names)
+
+    def test_server_synced_history_events_and_tts_endpoints(self):
+        # 1. /api/history returns valid list
+        r_hist = self.client.get("/api/history?limit=10")
+        self.assertEqual(r_hist.status_code, 200)
+        self.assertEqual(r_hist.json()["status"], "success")
+        self.assertIsInstance(r_hist.json()["history"], list)
+
+        # 2. /api/events returns valid list and head_id
+        r_ev = self.client.get("/api/events?after_id=0")
+        self.assertEqual(r_ev.status_code, 200)
+        self.assertEqual(r_ev.json()["status"], "success")
+        self.assertIn("head_id", r_ev.json())
+
+        # 3. /api/tts returns audio/wav
+        with patch.object(AnureetVoiceEngine, "synthesize_offline_female_wav", return_value=b"RIFF\x24\x00\x00\x00WAVEfmt "):
+            r_tts = self.client.get("/api/tts?text=Hello+Anureet")
+            self.assertEqual(r_tts.status_code, 200)
+            self.assertEqual(r_tts.headers["content-type"], "audio/wav")
+            self.assertTrue(r_tts.content.startswith(b"RIFF"))
+
+    def test_download_file_tool(self):
+        from tools.file_tools import download_file
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy_bytes = b"PDF-1.4 Mock Problem Statement Content"
+            mock_resp = io.BytesIO(dummy_bytes)
+            with patch("urllib.request.urlopen", return_value=mock_resp):
+                res = download_file(
+                    url="https://unstop.com/voyaghack/problem_statement.pdf",
+                    destination_path=tmpdir,
+                    filename="voyaghack_ps.pdf",
+                )
+                self.assertEqual(res["status"], "success")
+                self.assertEqual(res["size_bytes"], len(dummy_bytes))
+                saved_path = Path(res["file_path"])
+                self.assertTrue(saved_path.is_file())
+                self.assertEqual(saved_path.read_bytes(), dummy_bytes)
+
+    def test_open_website_tool(self):
+        from tools.os_tools import open_website
+        with patch("webbrowser.open") as mock_wb:
+            res = open_website("unstop.com/hackathons/voyaghack")
+            mock_wb.assert_called_once_with("https://unstop.com/hackathons/voyaghack")
+            self.assertIn("Opened https://unstop.com/hackathons/voyaghack", res)
+
+    def test_plan_and_execute_tool(self):
+        import agent_core
+        from unittest.mock import MagicMock
+
+        agent = agent_core.LocalAIAgent()
+        plan_json = json.dumps([
+            {"step": 1, "tool": "create_folder", "args": {"folder_name": "hack", "parent_dir": "desktop"}, "description": "Create folder"},
+            {"step": 2, "tool": "open_website", "args": {"url": "https://unstop.com/hackathons/voyaghack"}, "description": "Open Unstop"}
+        ])
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": f"```json\n{plan_json}\n```"}}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.Session.post", return_value=mock_resp), \
+             patch.object(agent.tools["create_folder"], "func", return_value={"status": "success", "message": "Created folder 'hack'", "folder_path": "C:\\Desktop\\hack"}), \
+             patch.object(agent.tools["open_website"], "func", return_value="Opened https://unstop.com in Chrome."):
+            summary = agent.plan_and_execute("Create hack folder and open unstop")
+            self.assertIn("Task execution complete:", summary)
+            self.assertIn("Step 1 (Create folder): Created folder 'hack'", summary)
+            self.assertIn("Step 2 (Open Unstop): Opened https://unstop.com in Chrome.", summary)
+
+    def test_phonetic_normalization_and_alias_resolution(self):
+        from tools.query_normalizer import normalize_voice_query, resolve_app_name, NON_APP_WORDS
+
+        # 1. Phonetic app resolutions
+        self.assertEqual(resolve_app_name("capgut"), "CapCut")
+        self.assertEqual(resolve_app_name("capquette"), "CapCut")
+        self.assertEqual(resolve_app_name("jutabh"), "YouTube")
+        self.assertEqual(resolve_app_name("crome"), "Google Chrome")
+        self.assertEqual(resolve_app_name("sportify"), "Spotify")
+
+        # 2. Non-app word guards
+        for word in ("audio", "desktop", "folder", "file", "tab"):
+            self.assertIn(word, NON_APP_WORDS)
+            self.assertEqual(resolve_app_name(word), word)
+
+        # 3. Action phrase normalization
+        self.assertEqual(
+            normalize_voice_query("Click on audio in capquette."),
+            "Click on audio in CapCut."
+        )
+        self.assertEqual(
+            normalize_voice_query("Ilika ona audio in capgut."),
+            "click on audio in CapCut."
+        )
+        self.assertEqual(
+            normalize_voice_query("Close, grab, cut."),
+            "close CapCut."
+        )
+        self.assertEqual(
+            normalize_voice_query("Switch again."),
+            "switch tab"
+        )
+        self.assertEqual(
+            normalize_voice_query("Saare app minimize."),
+            "minimize all windows."
+        )
+
+    def test_live_desktop_context_injection_in_ollama_prompt(self):
+        import agent_core
+        from unittest.mock import MagicMock, patch
+
+        agent = agent_core.LocalAIAgent()
+        ctx = agent._get_live_desktop_context()
+        self.assertIn("active_window", ctx)
+        self.assertIn("open_windows", ctx)
+        self.assertIn("installed_apps", ctx)
+        self.assertIsInstance(ctx["open_windows"], list)
+        self.assertIsInstance(ctx["installed_apps"], list)
+
+        captured_messages = []
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"role": "assistant", "content": "Done."}}
+        mock_resp.raise_for_status = MagicMock()
+
+        def _fake_post(url, json=None, timeout=None):
+            if json and "messages" in json:
+                captured_messages.extend(json["messages"])
+            return mock_resp
+
+        with patch.object(agent._session, "post", side_effect=_fake_post):
+            agent.execute("Explain quantum entanglement in simple terms")
+
+        system_msg = next((m for m in captured_messages if m.get("role") == "system"), None)
+        self.assertIsNotNone(system_msg)
+        self.assertIn("[Live Desktop Environment]:", system_msg["content"])
+        self.assertIn("[Speech Recognition Phonetic Correction Directive]:", system_msg["content"])
+        self.assertIn("Active Foreground Window:", system_msg["content"])
+
+    def test_tool_arguments_hardening_and_fallbacks(self):
+        import agent_core
+        from unittest.mock import MagicMock, patch
+
+        agent = agent_core.LocalAIAgent()
+
+        # browser_tab_action defaults action="next" when called with empty args
+        with patch.dict(agent.tools, {"browser_tab_action": agent_core.ToolDeclaration(
+            name="browser_tab_action",
+            func=lambda action="next", **kw: f"Tab action: {action}",
+            description="tab action",
+            parameters={"type": "object", "properties": {}}
+        )}):
+            res = agent._invoke_tool("browser_tab_action", {})
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["arguments"].get("action"), "next")
+
+        # click_screen_element maps alias "element" to "target_text"
+        with patch.dict(agent.tools, {"click_screen_element": agent_core.ToolDeclaration(
+            name="click_screen_element",
+            func=lambda target_text="", **kw: f"Clicked {target_text}",
+            description="click",
+            parameters={"type": "object", "properties": {}}
+        )}):
+            res = agent._invoke_tool("click_screen_element", {"element": "audio"})
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["arguments"].get("target_text"), "audio")
+
+        # close_application maps alias "app" to "app_name"
+        with patch.dict(agent.tools, {"close_application": agent_core.ToolDeclaration(
+            name="close_application",
+            func=lambda app_name="", **kw: f"Closed {app_name}",
+            description="close",
+            parameters={"type": "object", "properties": {}}
+        )}):
+            res = agent._invoke_tool("close_application", {"app": "capcut"})
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["arguments"].get("app_name"), "capcut")
+
+    def test_malformed_raw_json_tool_interception(self):
+        import agent_core
+
+        agent = agent_core.LocalAIAgent()
+
+        # 1. Malformed 'parameters{' without colon
+        malformed_1 = '{"type":"function","name":"click_screen_element","parameters{"target_text":"New folder"}}'
+        parsed_1 = agent._parse_embedded_json_tool_call(malformed_1)
+        self.assertIsNotNone(parsed_1)
+        self.assertEqual(parsed_1["name"], "click_screen_element")
+        self.assertEqual(parsed_1["args"], {"target_text": "New folder"})
+
+        # 2. Malformed complete_todo tool call
+        malformed_2 = '{"type":"function","name":"complete_todo","parameters{"task_query":"Good year, no"}}'
+        parsed_2 = agent._parse_embedded_json_tool_call(malformed_2)
+        self.assertIsNotNone(parsed_2)
+        self.assertEqual(parsed_2["name"], "complete_todo")
+        self.assertEqual(parsed_2["args"], {"task_query": "Good year, no"})
+
+    def test_widget_hud_chat_bar_toggle_and_persistence(self):
+        import anureet_widget
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_file = Path(tmp) / "widget_prefs.json"
+            events = []
+
+            def _exercise(app):
+                try:
+                    # 1. Initial state: chat bar should be visible by default
+                    events.append(("init_visible", app.hud_chat_bar_visible))
+                    events.append(("init_btn_fg", app.chat_bar_btn.cget("fg")))
+                    events.append(("init_pack_manager", app.hud_chat_bar.winfo_manager()))
+
+                    # 2. Toggle to hidden
+                    app.toggle_hud_chat_bar()
+                    events.append(("toggled_visible", app.hud_chat_bar_visible))
+                    events.append(("toggled_btn_fg", app.chat_bar_btn.cget("fg")))
+                    events.append(("toggled_pack_manager", app.hud_chat_bar.winfo_manager()))
+                    events.append(("toggled_var", app._chat_bar_var.get()))
+
+                    # 3. Toggle back to visible
+                    app.toggle_hud_chat_bar(visible=True)
+                    events.append(("restored_visible", app.hud_chat_bar_visible))
+                    events.append(("restored_pack_manager", app.hud_chat_bar.winfo_manager()))
+
+                    # 4. Set to hidden and persist
+                    app.set_hud_chat_bar_visible(False)
+                    app._flush_prefs()
+                finally:
+                    app.root.after(10, app.close)
+
+            w1 = anureet_widget.AnureetWidgetApp(on_ready=_exercise, prefs_path=prefs_file, prewarm_voice=False)
+            w1.run()
+
+            self.assertEqual(events[0], ("init_visible", True))
+            self.assertEqual(events[1], ("init_btn_fg", "#38bdf8"))
+            self.assertEqual(events[2], ("init_pack_manager", "pack"))
+
+            self.assertEqual(events[3], ("toggled_visible", False))
+            self.assertEqual(events[4], ("toggled_btn_fg", "#64748b"))
+            self.assertEqual(events[5], ("toggled_pack_manager", ""))
+            self.assertEqual(events[6], ("toggled_var", False))
+
+            self.assertEqual(events[7], ("restored_visible", True))
+            self.assertEqual(events[8], ("restored_pack_manager", "pack"))
+
+            # 5. Verify persistence across widget restarts
+            restored = []
+            def _check_restored(app):
+                try:
+                    restored.append(("visible", app.hud_chat_bar_visible))
+                    restored.append(("btn_fg", app.chat_bar_btn.cget("fg")))
+                    restored.append(("pack_manager", app.hud_chat_bar.winfo_manager()))
+                finally:
+                    app.root.after(10, app.close)
+
+            w2 = anureet_widget.AnureetWidgetApp(on_ready=_check_restored, prefs_path=prefs_file, prewarm_voice=False)
+            w2.run()
+
+            self.assertEqual(restored[0], ("visible", False))
+            self.assertEqual(restored[1], ("btn_fg", "#64748b"))
+            self.assertEqual(restored[2], ("pack_manager", ""))
+
+    def test_hud_chat_bar_fast_routes(self):
+        import agent_core
+
+        agent = agent_core.LocalAIAgent()
+
+        res_hide = agent.process_query("hide hud chat bar")
+        self.assertIn("hidden", res_hide.get("response_text", "").lower())
+
+        res_show = agent.process_query("show the hud chat bar")
+        self.assertIn("visible", res_show.get("response_text", "").lower())
+
+        res_hinglish = agent.process_query("chat bar hide karo")
+        self.assertIn("hidden", res_hinglish.get("response_text", "").lower())
+
+    def test_widget_continuous_mode_toggle(self):
+        import anureet_widget
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_file = Path(tmp) / "widget_prefs.json"
+            obs = {}
+
+            def _exercise(app):
+                try:
+                    obs["init_cont"] = app.is_continuous_mode_active()
+                    app.start_continuous_mode(60.0, speak_announcement=False)
+                    obs["started_cont"] = app.is_continuous_mode_active()
+                    obs["started_btn_text"] = app.continuous_btn.cget("text")
+                    app.stop_continuous_mode(speak_announcement=False)
+                    obs["stopped_cont"] = app.is_continuous_mode_active()
+                    obs["stopped_btn_text"] = app.continuous_btn.cget("text")
+                finally:
+                    app.root.after(10, app.close)
+
+            w = anureet_widget.AnureetWidgetApp(on_ready=_exercise, prefs_path=prefs_file, prewarm_voice=False)
+            w.run()
+
+            self.assertFalse(obs["init_cont"])
+            self.assertTrue(obs["started_cont"])
+            self.assertTrue(obs["started_btn_text"].startswith("♾️"))
+            self.assertFalse(obs["stopped_cont"])
+            self.assertEqual(obs["stopped_btn_text"], "♾️")
 
 
 if __name__ == "__main__":

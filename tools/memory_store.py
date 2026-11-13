@@ -66,6 +66,7 @@ def _connect(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
 
 def _init_schema(conn: sqlite3.Connection, key: str) -> None:
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memories (
@@ -127,6 +128,13 @@ def _init_schema(conn: sqlite3.Connection, key: str) -> None:
         conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, memory_id UNINDEXED)"
         )
+        conn.execute(
+            """
+            INSERT INTO memories_fts(content, memory_id)
+            SELECT m.content, m.id FROM memories m
+            WHERE NOT EXISTS (SELECT 1 FROM memories_fts f WHERE f.memory_id = m.id)
+            """
+        )
         _FTS5_SUPPORTED[key] = True
     except sqlite3.OperationalError:
         _FTS5_SUPPORTED[key] = False
@@ -178,8 +186,9 @@ def save_memory(fact: str, category: str = "fact", db_path: Optional[Path] = Non
 
 
 def recall_memory(query: str = "", limit: int = 5, db_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Search stored memories by keyword (FTS5 + token LIKE fallback) or list recent facts."""
+    """Search stored memories by keyword (FTS5 BM25 ranking + token LIKE fallback) returning top <=5 snippets."""
     cleaned = (query or "").strip()
+    effective_limit = max(1, min(int(limit or 5), 5))
     key = str(_resolve_db_path(db_path).resolve())
     rows: List[sqlite3.Row] = []
 
@@ -188,7 +197,7 @@ def recall_memory(query: str = "", limit: int = 5, db_path: Optional[Path] = Non
             if not cleaned:
                 rows = conn.execute(
                     "SELECT id, category, content, created_at FROM memories ORDER BY id DESC LIMIT ?",
-                    (limit,),
+                    (effective_limit,),
                 ).fetchall()
             else:
                 tokens = [t for t in re.findall(r"[A-Za-z0-9\u0900-\u097F]+", cleaned) if len(t) >= 2]
@@ -197,13 +206,14 @@ def recall_memory(query: str = "", limit: int = 5, db_path: Optional[Path] = Non
                     try:
                         rows = conn.execute(
                             """
-                            SELECT m.id, m.category, m.content, m.created_at
+                            SELECT m.id, m.category, m.content, m.created_at, bm25(memories_fts) AS rank
                             FROM memories_fts f
                             JOIN memories m ON m.id = f.memory_id
                             WHERE memories_fts MATCH ?
+                            ORDER BY rank ASC, m.id DESC
                             LIMIT ?
                             """,
-                            (fts_expr, limit),
+                            (fts_expr, effective_limit),
                         ).fetchall()
                     except sqlite3.OperationalError:
                         rows = []
@@ -211,7 +221,7 @@ def recall_memory(query: str = "", limit: int = 5, db_path: Optional[Path] = Non
                 if not rows:
                     terms = tokens or [cleaned]
                     clauses = " OR ".join("LOWER(content) LIKE ?" for _ in terms[:6])
-                    params = [f"%{t.lower()}%" for t in terms[:6]] + [limit]
+                    params = [f"%{t.lower()}%" for t in terms[:6]] + [effective_limit]
                     rows = conn.execute(
                         f"SELECT id, category, content, created_at FROM memories WHERE {clauses} ORDER BY id DESC LIMIT ?",
                         params,
@@ -305,25 +315,72 @@ def append_conversation_turn(
             conn.commit()
 
 
+_SYNCED_SESSIONS = ("web", "widget", "voice", "default")
+
+
 def get_recent_conversation(
     session_id: str = "default",
     limit: int = 6,
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, str]]:
     """Fetch the most recent conversation turns for a session in chronological order."""
+    sid = session_id or "default"
+    with _DB_LOCK:
+        with _connect(db_path) as conn:
+            if sid in _SYNCED_SESSIONS:
+                placeholders = ",".join("?" for _ in _SYNCED_SESSIONS)
+                rows = conn.execute(
+                    f"""
+                    SELECT role, content FROM (
+                        SELECT id, role, content FROM conversations
+                        WHERE session_id IN ({placeholders})
+                        ORDER BY id DESC LIMIT ?
+                    ) sub ORDER BY id ASC
+                    """,
+                    (*_SYNCED_SESSIONS, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT role, content FROM (
+                        SELECT id, role, content FROM conversations
+                        WHERE session_id = ?
+                        ORDER BY id DESC LIMIT ?
+                    ) sub ORDER BY id ASC
+                    """,
+                    (sid, limit),
+                ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def get_synced_history(
+    limit: int = 40,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch unified chronological conversation turns across web, widget, voice, and default sessions."""
+    placeholders = ",".join("?" for _ in _SYNCED_SESSIONS)
     with _DB_LOCK:
         with _connect(db_path) as conn:
             rows = conn.execute(
-                """
-                SELECT role, content FROM (
-                    SELECT id, role, content FROM conversations
-                    WHERE session_id = ?
+                f"""
+                SELECT id, session_id, role, content, created_at FROM (
+                    SELECT id, session_id, role, content, created_at FROM conversations
+                    WHERE session_id IN ({placeholders})
                     ORDER BY id DESC LIMIT ?
                 ) sub ORDER BY id ASC
                 """,
-                (session_id or "default", limit),
+                (*_SYNCED_SESSIONS, max(1, int(limit))),
             ).fetchall()
-    return [{"role": r["role"], "content": r["content"]} for r in rows]
+    return [
+        {
+            "id": int(r["id"]),
+            "source": r["session_id"],
+            "role": r["role"],
+            "content": r["content"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
 
 def add_todo_item(task: str, db_path: Optional[Path] = None) -> Dict[str, Any]:

@@ -9,15 +9,16 @@ from pydantic import BaseModel, Field
 
 
 class Config(BaseModel):
-    # Ollama settings
-    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Ollama settings (strictly loopback + 4GB VRAM air-gapped defaults)
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     default_model: str = os.getenv("OLLAMA_MODEL", "llama3.1-gpu:latest")
+    coder_model: str = os.getenv("OLLAMA_CODER_MODEL", "qwen2.5-coder:7b")
     ollama_timeout_seconds: int = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
-    # Voice & Multilingual STT settings
+    # Voice & Multilingual STT settings (pinned to CPU int8, 0 MB VRAM, 100% offline)
     whisper_model_name: str = os.getenv("WHISPER_MODEL", "small")
-    whisper_device: str = os.getenv("WHISPER_DEVICE", "auto")
-    whisper_compute_type: str = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
+    whisper_device: str = os.getenv("WHISPER_DEVICE", "cpu")
+    whisper_compute_type: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
     whisper_language: Optional[str] = os.getenv("WHISPER_LANGUAGE") or None
     voice_sample_rate: int = 16000
     extra_wake_words: List[str] = Field(default_factory=list)

@@ -4,18 +4,20 @@ Handles Ollama API communication, Jarvis Directives, App Control Modes,
 Deep Web Research Protocols, Self-Healing Code Execution, Fast Router, and JSON Tool Parsing.
 """
 
+import os
+import ctypes
 import json
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Match
+from typing import Any, Callable, Dict, List, Literal, Optional, Match
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from config import config
 from tools.os_tools import (
     open_application, close_application, close_session_apps, save_notepad_file_as,
-    write_to_notepad, open_website_or_search, system_control,
+    write_to_notepad, open_website_or_search, open_website, system_control,
     list_installed_apps, media_control, open_user_folder,
     _match_installed_app, URI_APP_ALIASES,
 )
@@ -24,6 +26,7 @@ from tools.gui_vision_tools import (
     chrome_select_profile_and_search, spotify_search_and_play,
     click_first_link_or_element, list_open_windows, focus_window,
     browser_tab_action, click_screen_element, type_in_search_bar,
+    minimize_all_windows,
 )
 from tools.live_screen_vision import scroll_screen, play_video_number_on_screen
 from tools.deep_research_tools import deep_research_topic, self_healing_python_exec
@@ -37,7 +40,7 @@ def shutdown_anureet(close_launched_apps: bool = False) -> Dict[str, Any]:
     return request_full_shutdown(close_launched_apps=close_launched_apps)
 from tools.premiere_tools import premiere_import_and_setup
 from tools.fl_studio_tools import fl_studio_action
-from tools.file_tools import list_files, search_files, read_file
+from tools.file_tools import list_files, search_files, read_file, create_folder, download_file
 from tools.memory_store import (
     save_memory, recall_memory, forget_memory,
     auto_extract_memories, append_conversation_turn, get_recent_conversation,
@@ -71,6 +74,94 @@ class ExecutionResult(BaseModel):
     execution_logs: List[str]
     tool_calls_made: List[Dict[str, Any]]
     execution_time_ms: float
+
+
+class ToolCallPayload(BaseModel):
+    """Validated structured tool call emitted natively or in JSON text."""
+
+    name: str = Field(..., min_length=1)
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_parameters_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "arguments" not in data and "parameters" in data:
+            copied = dict(data)
+            copied["arguments"] = copied.pop("parameters")
+            return copied
+        return data
+
+
+class CodeExecutionRequest(BaseModel):
+    """Validated sandboxed code execution request."""
+
+    language: Literal["python", "javascript", "c"] = "python"
+    code: str = Field(..., min_length=1)
+
+
+class AgentAction(BaseModel):
+    """Strict Pydantic schema for structured Ollama format= outputs."""
+
+    action: Literal["tool_call", "final_answer"]
+    tool_name: Optional[str] = None
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    response: str = ""
+
+
+_CODE_TASK_PATTERN = re.compile(
+    r"\b(?:python|javascript|node\.js|typescript|c\+\+|c\s+code|c\s+program|gcc|script|debug|"
+    r"traceback|stack\s*trace|syntax\s+error|self[- ]healing|refactor|unit\s+test|"
+    r"write\s+(?:a\s+)?(?:function|class|script|program|code)|code\s+likho)\b",
+    re.IGNORECASE,
+)
+
+OLLAMA_4GB_OPTIONS: Dict[str, Any] = {
+    "num_ctx": 2048,
+    "num_batch": 256,
+    "num_thread": 6,
+    "num_predict": 320,
+    "temperature": 0.1,
+}
+
+
+class _ClauseBuffer:
+    """Buffers streamed LLM tokens and flushes speakable clauses on punctuation (>= 25 chars)."""
+
+    DELIMITERS = (".", "!", "?", ":", "\n")
+
+    def __init__(self, on_clause: Optional[Callable[[str], None]], min_chars: int = 25):
+        self.on_clause = on_clause
+        self.min_chars = min_chars
+        self._buf = ""
+        self._emitted_any = False
+
+    def feed(self, delta: str) -> None:
+        if not delta or self.on_clause is None:
+            return
+        self._buf += delta
+        # Avoid speaking raw embedded JSON tool calls prematurely
+        if self._buf.lstrip().startswith("{"):
+            return
+        while True:
+            cut_idx = -1
+            for i, ch in enumerate(self._buf):
+                if ch in self.DELIMITERS and len(self._buf[: i + 1].strip()) >= self.min_chars:
+                    cut_idx = i + 1
+                    break
+            if cut_idx == -1:
+                break
+            clause = self._buf[:cut_idx].strip()
+            self._buf = self._buf[cut_idx:].lstrip()
+            if clause:
+                self._emitted_any = True
+                self.on_clause(clause)
+
+    def flush(self) -> None:
+        rem = self._buf.strip()
+        self._buf = ""
+        if rem and self.on_clause is not None and not rem.startswith("{"):
+            self._emitted_any = True
+            self.on_clause(rem)
 
 
 JARVIS_SYSTEM_PROMPT = (
@@ -111,15 +202,28 @@ def _detect_query_style(query: str) -> str:
 
 
 class LocalAIAgent:
-    def __init__(self, ollama_url: Optional[str] = None, model_name: Optional[str] = None):
+    def __init__(
+        self,
+        ollama_url: Optional[str] = None,
+        model_name: Optional[str] = None,
+        coder_model: Optional[str] = None,
+    ):
         self.ollama_url = (ollama_url or config.ollama_base_url).rstrip("/")
         self.model_name = model_name or config.default_model
+        self.coder_model = coder_model or getattr(config, "coder_model", "qwen2.5-coder:7b")
         self.tools: Dict[str, ToolDeclaration] = {}
         self.fast_routes: List[Dict[str, Any]] = []
         self._session = requests.Session()
+        self._session.trust_env = False  # Strict loopback transport without env proxy lookups
         self._tool_schemas_cache: Optional[List[Dict[str, Any]]] = None
         self._register_default_tools()
         self._register_default_fast_routes()
+
+    def _select_model_for_query(self, query: str) -> str:
+        """Route code/debug/self-healing tasks to qwen2.5-coder:7b when using default model."""
+        if self.model_name == config.default_model and _CODE_TASK_PATTERN.search(query or ""):
+            return self.coder_model
+        return self.model_name
 
     def check_ollama_status(self) -> bool:
         """Check whether the local Ollama server is reachable."""
@@ -176,13 +280,20 @@ class LocalAIAgent:
         """Register all GUI, application, research, and screen tools directly for LLM tool calling."""
         self.register_tool(
             "deep_research_topic", deep_research_topic,
-            "Execute Protocol 1: Deep Web Research Engine with query fan-out, multi-source scraping, and intelligence briefing.",
+            "Execute Protocol 1: 100% Offline Local Intelligence Synthesis across local memory and workspace files.",
             {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
         )
         self.register_tool(
             "self_healing_python_exec", self_healing_python_exec,
-            "Execute Protocol 2: Local System Access & Control with self-healing Python code execution.",
-            {"type": "object", "properties": {"script_code": {"type": "string"}}, "required": ["script_code"]}
+            "Execute Protocol 2: Sandboxed C / Python / JavaScript code execution inside TemporaryDirectory + Windows Job Object (10s limit).",
+            {
+                "type": "object",
+                "properties": {
+                    "script_code": {"type": "string"},
+                    "language": {"type": "string", "enum": ["python", "javascript", "c"]},
+                },
+                "required": ["script_code"],
+            },
         )
         self.register_tool(
             "open_application", open_application,
@@ -498,10 +609,160 @@ class LocalAIAgent:
             {"type": "object", "properties": {}}
         )
         self.register_tool(
+            "minimize_all_windows", minimize_all_windows,
+            "Minimize all open desktop windows and show the desktop (Win+D).",
+            {"type": "object", "properties": {}}
+        )
+        self.register_tool(
+            "create_folder", create_folder,
+            "Create a new folder on the Desktop (or Documents/Downloads/custom directory).",
+            {
+                "type": "object",
+                "properties": {
+                    "folder_name": {"type": "string"},
+                    "parent_dir": {"type": "string"}
+                },
+                "required": ["folder_name"]
+            }
+        )
+        self.register_tool(
             "shutdown_anureet", shutdown_anureet,
             "Shut down Anureet's widget, voice listener, backend server, and launcher-owned Ollama cleanly. Use close_launched_apps=true for 'stop and close everything'.",
             {"type": "object", "properties": {"close_launched_apps": {"type": "boolean"}}}
         )
+        self.register_tool(
+            "download_file", download_file,
+            "Download a file from a direct URL and save it to a local folder (desktop, downloads, documents, or absolute path).",
+            {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Direct HTTPS/HTTP URL to the file."},
+                    "destination_path": {"type": "string", "description": "Destination folder: 'desktop', 'downloads', 'documents', or absolute path."},
+                    "filename": {"type": "string", "description": "Optional filename to save as. Inferred from URL if omitted."},
+                },
+                "required": ["url"],
+            },
+        )
+        self.register_tool(
+            "open_website", open_website,
+            "Navigate Chrome directly to an exact URL without a Google search fallback (e.g. 'https://unstop.com/hackathons/voyaghack').",
+            {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+        )
+        self.register_tool(
+            "plan_and_execute", self.plan_and_execute,
+            "Break a complex multi-step agentic task into sequential sub-steps and execute them one by one (e.g. 'create folder hack, go to Unstop, download PDF, save to folder').",
+            {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]},
+        )
+
+    def plan_and_execute(self, task: str) -> str:
+        """Break a complex multi-step agentic task into sequential sub-steps and execute them.
+
+        Uses Ollama to generate a JSON plan, then executes each step using registered tools.
+
+        Args:
+            task: Natural language description of the multi-step task.
+
+        Returns:
+            Consolidated summary of all step outcomes.
+        """
+        import json as _json
+
+        PLAN_SYSTEM_PROMPT = (
+            "You are Anureet's task planner. Break the given task into 2-6 sequential steps. "
+            "Each step must map to exactly ONE tool call. "
+            "Output ONLY a JSON array of steps, no prose. Each step: "
+            "{\"step\": <int>, \"tool\": \"<tool_name>\", \"args\": {<key>: <value>}, \"description\": \"<what this does>\"}\n"
+            "Available tools: open_application, open_website, chrome_select_profile_and_search, "
+            "click_screen_element, browser_tab_action, type_text, type_in_search_bar, "
+            "create_folder, download_file, list_files, search_files, read_file, "
+            "scroll_screen, capture_screen, press_key, focus_window."
+        )
+
+        # --- Phase 1: Generate plan via Ollama ---
+        try:
+            _session = getattr(self, "_session", None) or requests.Session()
+            payload = {
+                "model": getattr(self, "model_name", None) or config.default_model,
+                "messages": [
+                    {"role": "system", "content": PLAN_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Task: {task}"},
+                ],
+                "stream": False,
+                "options": {
+                    "num_ctx": 2048,
+                    "num_predict": 512,
+                    "temperature": 0.0,
+                    "num_thread": 6,
+                },
+            }
+            ollama_endpoint = f"{getattr(self, 'ollama_url', config.ollama_base_url).rstrip('/')}/api/chat"
+            resp = _session.post(
+                ollama_endpoint,
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            raw_plan = resp.json().get("message", {}).get("content", "")
+        except Exception as e:
+            logger.error(f"plan_and_execute: Ollama plan generation failed: {e}")
+            return f"Could not generate execution plan: {e}"
+
+        # --- Phase 2: Parse JSON plan ---
+        json_match = re.search(r"\[.*\]", raw_plan, re.DOTALL)
+        if not json_match:
+            logger.warning(f"plan_and_execute: No JSON array found: {raw_plan[:200]}")
+            return f"Plan generation returned unrecognised format. Raw: {raw_plan[:300]}"
+
+        try:
+            steps = _json.loads(json_match.group(0))
+            if not isinstance(steps, list):
+                raise ValueError("Plan is not a list")
+        except Exception as e:
+            return f"Failed to parse plan JSON: {e}\nRaw: {raw_plan[:300]}"
+
+        # --- Phase 3: Execute steps sequentially ---
+        results: List[str] = []
+        context: Dict[str, Any] = {}
+
+        for step_obj in steps:
+            step_num = step_obj.get("step", "?")
+            tool_name = step_obj.get("tool", "")
+            args = dict(step_obj.get("args", {}))
+            description = step_obj.get("description", tool_name)
+
+            # Inject prior context values into args (simple $varname substitution)
+            for k, v in args.items():
+                if isinstance(v, str) and v.startswith("$"):
+                    var_name = v[1:]
+                    if var_name in context:
+                        args[k] = context[var_name]
+
+            tool_decl = self.tools.get(tool_name)
+            if not tool_decl:
+                msg = f"Step {step_num} ({description}): Tool '{tool_name}' not found — skipped."
+                logger.warning(msg)
+                results.append(msg)
+                continue
+
+            try:
+                raw_result = tool_decl.func(**args) if args else tool_decl.func()
+                if isinstance(raw_result, dict):
+                    step_msg = raw_result.get("message") or raw_result.get("status") or str(raw_result)
+                    for ckey in ("folder_path", "file_path", "url"):
+                        if ckey in raw_result:
+                            context[ckey] = raw_result[ckey]
+                else:
+                    step_msg = str(raw_result)
+                results.append(f"Step {step_num} ({description}): {step_msg}")
+                logger.info(f"plan_and_execute step {step_num} OK: {step_msg}")
+            except Exception as exc:
+                err_msg = f"Step {step_num} ({description}): ERROR — {exc}"
+                logger.error(err_msg)
+                results.append(err_msg)
+
+        summary = "\n".join(results)
+        logger.info(f"plan_and_execute completed {len(steps)} steps.")
+        return f"Task execution complete:\n{summary}"
 
     def register_fast_route(self, pattern: str, handler: Callable[[str, Match], str], name: str = "fast_route"):
         """Register a regex pattern for sub-50ms intent routing."""
@@ -511,7 +772,7 @@ class LocalAIAgent:
     def _register_default_fast_routes(self):
         """Built-in default fast routes for instant human-like physical desktop execution."""
 
-        # 0. Self-Shutdown Routes (runs first; distinct from laptop/PC shutdown)
+        # 0. Self-Shutdown & Conversational Wake/Courtesy Routes (runs first)
         self.register_fast_route(
             r"^\s*(?:anureet[,\s]+)?(?:stop\s+and\s+close\s+everything|close\s+and\s+stop\s+everything|stop\s+everything\s+and\s+close|shut\s*down\s+everything|sab\s+kuch\s+band\s+karo)\s*[.!?]*$",
             lambda q, m: shutdown_anureet(close_launched_apps=True)["message"],
@@ -521,6 +782,117 @@ class LocalAIAgent:
             r"^\s*(?:anureet[,\s]+)?(?:(?:switch\s+off|turn\s+off|shut\s*down|power\s+off|close|stop|exit|quit)\s+(?:yourself|anureet)|(?:do|shut)\s+yourself\s+down|yourself\s+(?:off|down)|(?:khud|apne\s+aap)\s+ko\s+band\s+karo|band\s+ho\s+jao)\s*[.!?]*$",
             lambda q, m: shutdown_anureet(close_launched_apps=False)["message"],
             name="shutdown_anureet",
+        )
+        self.register_fast_route(
+            r"^\s*(?:hey\s+|hi\s+|hello\s+)?anureet\s*[.!?]*$",
+            lambda q, m: "Yes! I'm listening. How can I help you?",
+            name="greeting",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:thank\s+you|thanks|many\s+thanks|shukriya|dhanyawad)(?:\s+(?:so\s+much|very\s+much|anureet))?\s*[.!?]*$",
+            lambda q, m: "You're welcome! Let me know if you need anything else.",
+            name="courtesy",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:minimize\s+all(?:\s+(?:apps?|windows?))?|show\s+desktop|hide\s+all\s+(?:apps?|windows?)|(?:sabhi|saare|all)\s+(?:apps?|windows?)\s+minimize\s+karo)\s*[.!?]*$",
+            lambda q, m: minimize_all_windows()["message"],
+            name="minimize_all_windows",
+        )
+
+        def _fast_hud_chat_bar(query: str, match: Match) -> str:
+            raw = (match.group(1) or "").strip().lower()
+            try:
+                from tools.memory_store import publish_widget_event
+                if any(w in raw for w in ("hide", "chupao", "band", "close", "off")):
+                    publish_widget_event("hud_chat_bar", user_text="hide", source="agent")
+                    return "HUD chat bar is now hidden. You can show it anytime using the 💬 button in the HUD header or via right-click."
+                elif any(w in raw for w in ("show", "dikhao", "kholo", "open", "on")):
+                    publish_widget_event("hud_chat_bar", user_text="show", source="agent")
+                    return "HUD chat bar is now visible."
+                else:
+                    publish_widget_event("hud_chat_bar", user_text="toggle", source="agent")
+                    return "Toggled HUD chat bar visibility."
+            except Exception as e:
+                return f"Could not toggle HUD chat bar: {e}"
+
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(hide|show|toggle)\s+(?:the\s+)?(?:hud\s+)?chat\s+bar\s*[.!?]*$",
+            _fast_hud_chat_bar,
+            name="hud_chat_bar_control",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:hud\s+)?chat\s+bar\s+(hide|show|toggle|chupao|dikhao|kholo|band)\s*(?:karo)?\s*[.!?]*$",
+            _fast_hud_chat_bar,
+            name="hud_chat_bar_control",
+        )
+
+        def _fast_continuous_chat(query: str, match: Match) -> str:
+            raw = (query or "").strip().lower()
+            try:
+                from tools.memory_store import publish_widget_event
+                if any(w in raw for w in ("stop", "exit", "band", "normal", "wake", "strict")):
+                    publish_widget_event("continuous_chat", user_text="stop", source="agent")
+                    return "Continuous chat mode ended. Reverting to strict wake word mode ('Anureet <command>')."
+                else:
+                    publish_widget_event("continuous_chat", user_text="start", source="agent")
+                    return "Continuous listening mode activated for 1 minute. You can speak freely without saying Anureet."
+            except Exception as e:
+                return f"Could not toggle continuous chat mode: {e}"
+
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:"
+            r"listen\s+continuously|continuous(?:ly)?\s+listen|"
+            r"start\s+continuous(?:\s+chat|\s+mode|\s+listening)?|"
+            r"continuous\s+(?:chat|mode|listening)(?:\s+mode)?|"
+            r"1\s*min(?:ute)?\s+continuous\s+chat|"
+            r"baat\s+karte\s+raho|continuous\s+suno"
+            r")\s*[.!?]*$",
+            _fast_continuous_chat,
+            name="continuous_chat_start",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:"
+            r"stop\s+continuous(?:\s+chat|\s+mode|\s+listening)?|"
+            r"exit\s+continuous(?:\s+chat|\s+mode)?|"
+            r"stop\s+listening\s+continuously|"
+            r"normal\s+mode|wake\s*word\s+mode|strict\s+(?:command\s+)?mode|"
+            r"continuous\s+(?:chat\s+)?band\s+karo|bas\s+anureet"
+            r")\s*[.!?]*$",
+            _fast_continuous_chat,
+            name="continuous_chat_stop",
+        )
+
+        def _fast_create_folder(query: str, match: Match) -> str:
+            groups = [g for g in match.groups() if g]
+            parent = "desktop"
+            name = ""
+            for g in groups:
+                low = g.strip().lower()
+                if low in ("desktop", "documents", "downloads", "home"):
+                    parent = low
+                else:
+                    name = g.strip(" \t\r\n'\".,")
+            return create_folder(name, parent_dir=parent)["message"]
+
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:create|make)\s+(?:a\s+)?(?:new\s+)?folder\s+(?:on|in)\s+(desktop|documents|downloads)\s+(?:named|called)\s+['\"]?(.+?)['\"]?\s*[.!?]*$",
+            _fast_create_folder,
+            name="create_folder",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:create|make)\s+(?:a\s+)?(?:new\s+)?folder\s+(?:on|in)\s+(desktop|documents|downloads)\s+['\"]?([a-zA-Z0-9._\-\s]+?)['\"]?\s*[.!?]*$",
+            _fast_create_folder,
+            name="create_folder",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:create|make)\s+(?:a\s+)?(?:new\s+)?folder\s+(?:named|called\s+)?['\"]?(.+?)['\"]?(?:\s+(?:on|in)\s+(desktop|documents|downloads))?\s*[.!?]*$",
+            _fast_create_folder,
+            name="create_folder",
+        )
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(desktop|documents|downloads)\s+(?:pe|par|pr|mein|me)\s+['\"]?(.+?)['\"]?\s+(?:naam\s+ka\s+)?(?:new\s+)?folder\s+(?:banao|create\s+karo)\s*[.!?]*$",
+            _fast_create_folder,
+            name="create_folder",
         )
 
         # 1. Deep Research & Real-Time Utility Routes
@@ -652,13 +1024,13 @@ class LocalAIAgent:
         )
 
         # Browser Tab Switching & Management
-        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:switch|next)\s+tab\s*[.!?]*$", lambda q, m: browser_tab_action("next"), name="browser_tab_action")
-        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:previous|prev|last|back)\s+tab\s*[.!?]*$", lambda q, m: browser_tab_action("previous"), name="browser_tab_action")
+        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:switch|next)\s+(?:tab|again)\s*[.!?]*$", lambda q, m: browser_tab_action("next"), name="browser_tab_action")
+        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:previous|prev|last|back)\s+(?:tab|again)\s*[.!?]*$", lambda q, m: browser_tab_action("previous"), name="browser_tab_action")
         self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:switch|go)\s+to\s+(.+?)\s+tab\s*[.!?]*$", lambda q, m: browser_tab_action("switch_to", m.group(1)), name="browser_tab_action")
         self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:open\s+)?new\s+tab\s*[.!?]*$", lambda q, m: browser_tab_action("new"), name="browser_tab_action")
         self.register_fast_route(r"^\s*(?:anureet[,\s]+)?close\s+(?:this\s+|current\s+)?tab\s*[.!?]*$", lambda q, m: browser_tab_action("close"), name="browser_tab_action")
         self.register_fast_route(r"^\s*(?:anureet[,\s]+)?reopen\s+(?:closed\s+)?tab\s*[.!?]*$", lambda q, m: browser_tab_action("reopen"), name="browser_tab_action")
-        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:tab\s+badlo|agla\s+tab)\s*[.!?]*$", lambda q, m: browser_tab_action("next"), name="browser_tab_action")
+        self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:tab\s+badlo|agla\s+tab|phir\s+se\s+switch\s+karo)\s*[.!?]*$", lambda q, m: browser_tab_action("next"), name="browser_tab_action")
 
         self.register_fast_route(r"^\s*(?:anureet[,\s]+)?(?:open|launch|start)\s+youtube\s*[.!?]*$", lambda q, m: open_application("youtube"), name="open_application")
         self.register_fast_route(r".*search\s+(.*)\s+in.*(chrome|browser).*", _fast_chrome_search, name="chrome_select_profile_and_search")
@@ -859,7 +1231,43 @@ class LocalAIAgent:
         self.register_fast_route(r".*\b(open|launch|start)\b.*task\s+manager.*", lambda q, m: open_application("task manager"), name="open_application")
         self.register_fast_route(r".*\b(open|launch|start)\b.*(ms\s+)?word.*", lambda q, m: open_application("word"), name="open_application")
 
-        # 10. Key Press & Hotkeys
+        # 10. Download, open_website & plan_and_execute fast routes
+        def _fast_download(query: str, match: Match) -> str:
+            url = (match.group(1) or "").strip()
+            dest = (match.group(2) or "desktop").strip().lower() if match.lastindex and match.lastindex >= 2 and match.group(2) else "desktop"
+            if not url.startswith(("http://", "https://")):
+                return f"Please provide a full https:// URL to download."
+            result = download_file(url=url, destination_path=dest)
+            return result.get("message", str(result))
+
+        self.register_fast_route(
+            r"^[\s]*(?:anureet[,\s]+)?(?:please\s+)?download\s+(?:the\s+)?(?:file\s+)?(?:from\s+)?(https?://\S+)(?:\s+(?:to|into|in|save\s+to)\s+(desktop|downloads|documents))?[\s.!?]*$",
+            _fast_download,
+            name="download_file",
+        )
+
+        def _fast_open_website(query: str, match: Match) -> str:
+            url = (match.group(1) or "").strip()
+            return open_website(url)
+
+        self.register_fast_route(
+            r"^[\s]*(?:anureet[,\s]+)?(?:please\s+)?(?:open|navigate|go)\s+(?:to\s+)?(https?://\S+|www\.\S+)[\s.!?]*$",
+            _fast_open_website,
+            name="open_website",
+        )
+
+        def _fast_plan(query: str, match: Match) -> str:
+            task = query.strip()
+            return self.plan_and_execute(task)
+
+        self.register_fast_route(
+            r"^\s*(?:anureet[,\s]+)?(?:please\s+)?(?:create|make)\s+(?:a\s+)?folder\s+(?:named?|called)?\s*['\"]?(\w[\w\s._-]*?)['\"]?"
+            r"\s+(?:on|in)\s+desktop\s+and\s+(?:download|get|save).*(?:from|at)\s+(https?://\S+).*$",
+            _fast_plan,
+            name="plan_and_execute",
+        )
+
+        # 11. Key Press & Hotkeys
         self.register_fast_route(r"^\s*press\s+(.*)$", lambda q, m: sanitize_and_press_key(m.group(1)), name="press_key")
 
         # 11. Memory, Productivity, Window & Briefing Routes (English + Hinglish)
@@ -1005,6 +1413,70 @@ class LocalAIAgent:
         ]
         return self._tool_schemas_cache
 
+    def _select_tool_schemas_for_query(self, query: str) -> List[Dict[str, Any]]:
+        """Select a compact subset (<= 14 tools) for the query to prevent num_ctx=2048 overflow."""
+        if len(self.tools) <= 15:
+            return self._get_ollama_tool_schemas()
+
+        q = (query or "").lower()
+        selected_names: Set[str] = {
+            "open_application", "focus_window", "click_screen_element",
+            "minimize_all_windows", "create_folder", "type_in_search_bar",
+        }
+
+        if any(w in q for w in ("tab", "browser", "chrome", "edge", "switch", "url", "web", "site")):
+            selected_names.update(["browser_tab_action", "chrome_select_profile_and_search", "open_website_or_search", "open_website"])
+        if any(w in q for w in ("type", "write", "enter", "key", "press")):
+            selected_names.add("type_text")
+        if any(w in q for w in ("notepad", "note", "file", "save", "read", "folder", "desktop", "document")):
+            selected_names.update(["write_to_notepad", "save_notepad_file_as", "list_files", "search_files", "read_file", "open_user_folder"])
+        if any(w in q for w in ("download", "fetch", "get file", "save file", "pdf")):
+            selected_names.update(["download_file", "create_folder", "open_website"])
+        if any(w in q for w in ("weather", "mausam", "rain", "temperature", "forecast")):
+            selected_names.add("get_weather")
+        if any(w in q for w in ("briefing", "morning", "status", "battery", "time", "clock", "date")):
+            selected_names.update(["get_morning_briefing", "get_system_status", "get_world_time"])
+        if any(w in q for w in ("timer", "stopwatch", "countdown")):
+            selected_names.update(["set_timer", "list_timers", "cancel_timer"])
+        if any(w in q for w in ("todo", "task", "list")):
+            selected_names.update(["add_todo", "list_todos", "complete_todo"])
+        if any(w in q for w in ("remind", "reminder")):
+            selected_names.update(["add_reminder", "list_reminders"])
+        if any(w in q for w in ("remember", "recall", "memory", "yaad")):
+            selected_names.update(["save_memory", "recall_memory", "forget_memory"])
+        if any(w in q for w in ("song", "music", "spotify", "play", "pause", "media", "volume", "gaana", "audio")):
+            selected_names.update(["spotify_search_and_play", "media_control"])
+        if any(w in q for w in ("window", "windows", "app", "close", "quit", "exit")):
+            selected_names.update(["list_open_windows", "close_application", "close_session_apps", "shutdown_anureet"])
+        if any(w in q for w in ("python", "code", "script", "program", "calc", "calculate")):
+            selected_names.update(["self_healing_python_exec", "deep_research_topic"])
+        if any(w in q for w in ("research", "search", "google", "explain", "find")):
+            selected_names.update(["deep_research_topic", "chrome_select_profile_and_search"])
+        if any(w in q for w in ("clipboard", "copy", "paste")):
+            selected_names.update(["copy_to_clipboard", "get_clipboard_content"])
+        if any(w in q for w in ("scroll", "screen", "see", "look")):
+            selected_names.update(["scroll_screen", "capture_screen"])
+        if "premiere" in q:
+            selected_names.add("premiere_import_and_setup")
+        if "fl studio" in q:
+            selected_names.add("fl_studio_action")
+        if any(w in q for w in ("plan", "step by step", "then", "and then", "aur phir", "then download", "then save", "aur download", "download", "fetch", "pdf", "unstop", "hackathon")):
+            selected_names.update(["plan_and_execute", "create_folder", "download_file", "open_website"])
+
+        schemas = []
+        for name in selected_names:
+            tool = self.tools.get(name)
+            if tool:
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+        return schemas or self._get_ollama_tool_schemas()
+
     def _match_fast_route(self, query: str) -> Optional[Dict[str, Any]]:
         """Match query against fast routes and return route name + output."""
         for route in self.fast_routes:
@@ -1027,26 +1499,143 @@ class LocalAIAgent:
         matched = self._match_fast_route(query)
         return matched["output"] if matched else None
 
+    def _get_live_desktop_context(self) -> Dict[str, Any]:
+        """Retrieve active foreground window, visible open window titles, and installed app names."""
+        active_window = ""
+        open_windows: List[str] = []
+        anureet_titles = {"anureet", "anureet ai", "anureet hud", "anureet widget", "tk", "hud"}
+
+        # 1. Active foreground window
+        if os.name == "nt" and hasattr(ctypes, "windll"):
+            try:
+                user32 = ctypes.windll.user32
+                fg = user32.GetForegroundWindow()
+                if fg:
+                    buf = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(fg, buf, 256)
+                    t = buf.value.strip()
+                    if t and t.lower() not in anureet_titles:
+                        active_window = t
+            except Exception:
+                pass
+
+        # 2. Open visible windows
+        try:
+            import pygetwindow as gw
+            all_w = gw.getAllWindows()
+            for w in all_w:
+                t = (w.title or "").strip()
+                if t and t.lower() not in anureet_titles and not getattr(w, "isMinimized", False):
+                    if t not in open_windows:
+                        open_windows.append(t)
+            if not open_windows:
+                for t in gw.getAllTitles():
+                    cl = (t or "").strip()
+                    if cl and cl.lower() not in anureet_titles and cl not in open_windows:
+                        open_windows.append(cl)
+        except Exception:
+            pass
+
+        # 3. Installed key applications catalog
+        installed_apps: List[str] = [
+            "CapCut", "Google Chrome", "Spotify", "Notepad", "VS Code",
+            "FL Studio", "Premiere Pro", "Task Manager", "File Explorer", "Calculator"
+        ]
+        try:
+            from tools.os_tools import _get_installed_apps_index
+            app_list = _get_installed_apps_index()
+            if app_list:
+                discovered = [a["name"] for a in app_list if a.get("name")]
+                priority = ["CapCut", "Chrome", "Spotify", "Notepad", "Visual Studio Code", "FL Studio", "Premiere"]
+                top_found = [d for d in discovered if any(p.lower() in d.lower() for p in priority)]
+                other_found = [d for d in discovered if d not in top_found]
+                installed_apps = (top_found + other_found)[:12]
+        except Exception:
+            pass
+
+        return {
+            "active_window": active_window or "None / Desktop",
+            "open_windows": open_windows[:8],
+            "installed_apps": installed_apps[:12],
+        }
+
     def _parse_embedded_json_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
-        """Intercept raw JSON tool call objects emitted in text by LLM (supports nested dicts)."""
+        """Validate embedded JSON tool calls via Pydantic ToolCallPayload schema, repairing malformed delimiters."""
         if not text or "{" not in text:
             return None
+
+        # 1. Repair common malformed patterns like "parameters{" or "parameters" { or "arguments{"
+        cleaned = re.sub(r'"(parameters|arguments)"?\s*\{', r'"\1": {', text)
+        cleaned_stripped = cleaned.strip()
+
+        # Check if entire cleaned string is JSON
+        if cleaned_stripped.startswith("{"):
+            try:
+                validated = ToolCallPayload.model_validate_json(cleaned_stripped)
+                return {"name": validated.name, "args": validated.arguments}
+            except ValidationError:
+                pass
+
+        # Check raw decode across occurrences
         decoder = json.JSONDecoder()
         idx = 0
         while True:
-            start = text.find("{", idx)
+            start = cleaned.find("{", idx)
             if start == -1:
                 break
             try:
-                obj, _ = decoder.raw_decode(text, start)
-                if isinstance(obj, dict) and isinstance(obj.get("name"), str):
-                    params = obj.get("parameters", obj.get("arguments", {}))
-                    if isinstance(params, dict):
-                        return {"name": obj["name"], "args": params}
-            except json.JSONDecodeError:
+                obj, _ = decoder.raw_decode(cleaned, start)
+                if isinstance(obj, dict):
+                    # Handle {"type": "function", "function": {"name": ..., "arguments": ...}}
+                    if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
+                        f_obj = obj["function"]
+                        if "name" in f_obj:
+                            val = ToolCallPayload.model_validate(f_obj)
+                            return {"name": val.name, "args": val.arguments}
+                    if "name" in obj:
+                        val = ToolCallPayload.model_validate(obj)
+                        return {"name": val.name, "args": val.arguments}
+            except (json.JSONDecodeError, ValidationError):
                 pass
             idx = start + 1
+
+        # Regex fallback for {"type":"function","name":"...","parameters":{...}}
+        m_name = re.search(r'"name"\s*:\s*"([a-zA-Z0-9_-]+)"', cleaned)
+        if m_name:
+            tool_name = m_name.group(1)
+            m_args = re.search(r'"(?:parameters|arguments)"\s*:\s*(\{.*?\})', cleaned, re.DOTALL)
+            parsed_args = {}
+            if m_args:
+                try:
+                    parsed_args = json.loads(m_args.group(1))
+                except json.JSONDecodeError:
+                    pass
+            return {"name": tool_name, "args": parsed_args}
+
         return None
+
+    def plan_structured_action(self, user_query: str, model_override: Optional[str] = None) -> AgentAction:
+        """Request strict Pydantic JSON output from Ollama using format=AgentAction.model_json_schema()."""
+        active_model = model_override or self._select_model_for_query(user_query)
+        payload = {
+            "model": active_model,
+            "messages": [
+                {"role": "system", "content": JARVIS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_query},
+            ],
+            "stream": False,
+            "format": AgentAction.model_json_schema(),
+            "keep_alive": "15m",
+            "options": dict(OLLAMA_4GB_OPTIONS),
+        }
+        resp = self._session.post(
+            f"{self.ollama_url}/api/chat",
+            json=payload,
+            timeout=config.ollama_timeout_seconds,
+        )
+        resp.raise_for_status()
+        content = (resp.json().get("message", {}) or {}).get("content", "")
+        return AgentAction.model_validate_json(content)
 
     @staticmethod
     def _format_tool_result(result: Any) -> str:
@@ -1065,6 +1654,46 @@ class LocalAIAgent:
                 tool_args = {}
         if not isinstance(tool_args, dict):
             tool_args = {}
+
+        # Normalize argument aliases across tools
+        if tool_name == "click_screen_element" and not tool_args.get("target_text"):
+            for k in ("element", "text", "target", "label", "button", "name", "query"):
+                if tool_args.get(k):
+                    tool_args["target_text"] = str(tool_args[k])
+                    break
+        elif tool_name == "browser_tab_action":
+            if not tool_args.get("action"):
+                for k in ("act", "cmd", "command", "operation"):
+                    if tool_args.get(k):
+                        tool_args["action"] = str(tool_args[k])
+                        break
+            if not tool_args.get("action"):
+                tool_args["action"] = "next"
+        elif tool_name == "focus_window" and not tool_args.get("title_query"):
+            for k in ("query", "window", "title", "app", "name", "target"):
+                if tool_args.get(k):
+                    tool_args["title_query"] = str(tool_args[k])
+                    break
+        elif tool_name == "create_folder" and not tool_args.get("folder_name"):
+            for k in ("name", "folder", "path", "dir", "directory"):
+                if tool_args.get(k):
+                    tool_args["folder_name"] = str(tool_args[k])
+                    break
+        elif tool_name == "open_application" and not tool_args.get("app_name"):
+            for k in ("name", "app", "application"):
+                if tool_args.get(k):
+                    tool_args["app_name"] = str(tool_args[k])
+                    break
+        elif tool_name == "close_application" and not tool_args.get("app_name"):
+            for k in ("name", "app", "application", "window", "query"):
+                if tool_args.get(k):
+                    tool_args["app_name"] = str(tool_args[k])
+                    break
+        elif tool_name in ("complete_todo", "delete_todo") and not tool_args.get("task_query"):
+            for k in ("query", "task", "todo", "name", "item", "title"):
+                if tool_args.get(k):
+                    tool_args["task_query"] = str(tool_args[k])
+                    break
 
         if tool_name not in self.tools:
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -1105,17 +1734,59 @@ class LocalAIAgent:
             "ok": ok,
         }
 
+    def _read_ollama_response(
+        self,
+        resp: Any,
+        streaming: bool,
+        clause_buf: Optional[_ClauseBuffer],
+    ) -> Dict[str, Any]:
+        """Parse either non-streaming JSON or NDJSON streaming lines from Ollama /api/chat."""
+        if not streaming:
+            return resp.json()
+
+        full_parts: List[str] = []
+        collected_tools: List[Dict[str, Any]] = []
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            chunk = json.loads(raw_line)
+            msg_chunk = chunk.get("message") or {}
+            delta = msg_chunk.get("content") or ""
+            chunk_tools = msg_chunk.get("tool_calls") or []
+            if chunk_tools:
+                collected_tools.extend(chunk_tools)
+            if delta:
+                full_parts.append(delta)
+                if clause_buf is not None and not collected_tools:
+                    clause_buf.feed(delta)
+            if chunk.get("done"):
+                break
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "".join(full_parts),
+                "tool_calls": collected_tools,
+            }
+        }
+
     def execute(
         self,
         user_query: str,
         system_prompt: Optional[str] = None,
         log_callback: Optional[Callable[[str], None]] = None,
         session_id: str = "default",
+        on_clause: Optional[Callable[[str], None]] = None,
     ) -> ExecutionResult:
         """Main execution pipeline with Mode Controller, Fast Router, Memory Injection, and Ollama Loop."""
         start_time = time.perf_counter()
         logs: List[str] = []
         tool_calls_made: List[Dict[str, Any]] = []
+        streamed_speech = {"sent": False}
+
+        def emit_clause_once(text: str) -> None:
+            if on_clause is not None and text and not streamed_speech["sent"]:
+                streamed_speech["sent"] = True
+                on_clause(text)
 
         def emit_log(msg: str):
             logs.append(msg)
@@ -1127,6 +1798,8 @@ class LocalAIAgent:
 
         def finalize(response_text: str, routed_fast: bool, persist_turn: bool = True) -> ExecutionResult:
             exec_time = (time.perf_counter() - start_time) * 1000
+            if response_text:
+                emit_clause_once(response_text)
             if persist_turn:
                 try:
                     append_conversation_turn(session_id, "user", user_query)
@@ -1150,6 +1823,15 @@ class LocalAIAgent:
                 publish_widget_event("thinking", user_text=user_query, source=session_id)
             except Exception:
                 pass
+
+        # Phonetic query normalization & live desktop context
+        desktop_ctx = self._get_live_desktop_context()
+        try:
+            from tools.query_normalizer import normalize_voice_query
+            user_query = normalize_voice_query(user_query, open_window_titles=desktop_ctx.get("open_windows", []))
+        except Exception as norm_err:
+            logger.debug(f"Query normalization error: {norm_err}")
+
         try:
             extracted_facts = auto_extract_memories(user_query)
             if extracted_facts:
@@ -1185,6 +1867,25 @@ class LocalAIAgent:
 
         # 2. Ollama Reasoning Loop with Jarvis Directives, Long-Term Memory & Conversation Context
         system_content = system_prompt or JARVIS_SYSTEM_PROMPT
+
+        # Inject Live Desktop Environment & STT Correction Directive
+        active_win = desktop_ctx.get("active_window", "None / Desktop")
+        open_wins = ", ".join(f'"{w}"' for w in desktop_ctx.get("open_windows", [])) or "None detected"
+        installed = ", ".join(f'"{a}"' for a in desktop_ctx.get("installed_apps", []))
+        desktop_block = (
+            f"\n\n[Live Desktop Environment]:\n"
+            f"- Active Foreground Window: \"{active_win}\"\n"
+            f"- Open Desktop Windows: [{open_wins}]\n"
+            f"- Installed Key Apps: [{installed}]\n\n"
+            f"[Speech Recognition Phonetic Correction Directive]:\n"
+            f"The user is speaking aloud through a microphone. The input text was generated by speech-to-text and may "
+            f"contain phonetic distortions, accents, or misspellings (e.g., 'capquette'/'capgut'/'grab cut' means CapCut, "
+            f"'jutabh' means YouTube, 'switch again' means switch browser tab, 'saare app minimize' means minimize all windows). "
+            f"ALWAYS cross-reference the user's spoken words with the Live Desktop Environment above to deduce the true intent "
+            f"before selecting or calling any tool."
+        )
+        system_content = f"{system_content}{desktop_block}"
+
         query_style = _detect_query_style(user_query)
         if query_style == "hinglish":
             system_content = (
@@ -1198,7 +1899,7 @@ class LocalAIAgent:
                 "[Current Turn Style]: User wrote in Devanagari Hindi. Reply in warm, clear, everyday conversational Hindi."
             )
         try:
-            recalled = recall_memory(user_query, limit=3).get("memories", [])
+            recalled = recall_memory(user_query, limit=5).get("memories", [])
             if recalled:
                 facts_block = "\n".join(f"- {m['content']}" for m in recalled)
                 system_content = f"{system_content}\n\nKnown User Memory Context:\n{facts_block}"
@@ -1214,47 +1915,52 @@ class LocalAIAgent:
             logger.debug(f"History load skipped: {hist_err}")
         messages.append({"role": "user", "content": user_query})
 
-        tools_schema = self._get_ollama_tool_schemas()
+        streaming = on_clause is not None
+        active_model = self._select_model_for_query(user_query)
+        tools_schema = self._select_tool_schemas_for_query(user_query)
         max_turns = 5
         turn = 0
 
         while turn < max_turns:
             turn += 1
-            emit_log(f"Turn {turn}: Sending payload to Ollama model '{self.model_name}'...")
+            emit_log(f"Turn {turn}: Sending payload to Ollama model '{active_model}'...")
 
+            def _streaming_clause_sink(clause_text: str) -> None:
+                streamed_speech["sent"] = True
+                if on_clause is not None:
+                    on_clause(clause_text)
+
+            clause_buf = _ClauseBuffer(_streaming_clause_sink) if streaming else None
             payload: Dict[str, Any] = {
-                "model": self.model_name,
+                "model": active_model,
                 "messages": messages,
-                "stream": False,
+                "stream": streaming,
                 "keep_alive": "15m",
-                "options": {"num_ctx": 4096, "num_predict": 320, "temperature": 0.2},
+                "options": dict(OLLAMA_4GB_OPTIONS),
             }
             if tools_schema:
                 payload["tools"] = tools_schema
 
             try:
-                resp = self._session.post(
-                    f"{self.ollama_url}/api/chat",
-                    json=payload,
-                    timeout=config.ollama_timeout_seconds
-                )
+                post_kwargs: Dict[str, Any] = {"json": payload, "timeout": config.ollama_timeout_seconds}
+                if streaming:
+                    post_kwargs["stream"] = True
+                resp = self._session.post(f"{self.ollama_url}/api/chat", **post_kwargs)
                 if resp.status_code == 404:
                     fallback_model = self._fallback_to_installed_model()
-                    if fallback_model and fallback_model != self.model_name:
-                        old_model = self.model_name
-                        self.model_name = fallback_model
+                    if fallback_model and fallback_model != active_model:
+                        old_model = active_model
+                        active_model = fallback_model
+                        if old_model == self.model_name:
+                            self.model_name = fallback_model
                         payload["model"] = fallback_model
                         logger.warning(
                             f"Ollama model '{old_model}' not found (404); switching to installed model '{fallback_model}'."
                         )
                         emit_log(f"Model '{old_model}' not found; switched to '{fallback_model}'.")
-                        resp = self._session.post(
-                            f"{self.ollama_url}/api/chat",
-                            json=payload,
-                            timeout=config.ollama_timeout_seconds
-                        )
+                        resp = self._session.post(f"{self.ollama_url}/api/chat", **post_kwargs)
                 resp.raise_for_status()
-                data = resp.json()
+                data = self._read_ollama_response(resp, streaming=streaming, clause_buf=clause_buf)
             except requests.ConnectionError as e:
                 style = _detect_query_style(user_query)
                 err_msg = (
@@ -1294,13 +2000,34 @@ class LocalAIAgent:
                     })
                     return finalize(exec_info["result_str"], routed_fast=False)
 
+                if content.lstrip().startswith("{") and ('"type"' in content or '"name"' in content or '"parameters' in content):
+                    emit_log("Suppressed malformed raw JSON tool output.")
+                    return finalize("I couldn't complete that action cleanly. Please try rephrasing your command.", routed_fast=False)
+
+                if clause_buf is not None:
+                    clause_buf.flush()
                 emit_log("Completed execution.")
                 return finalize(content, routed_fast=False)
 
             for call in tool_calls:
-                func_obj = call.get("function", {})
-                tool_name = func_obj.get("name", "")
-                tool_args = func_obj.get("arguments", {})
+                func_obj = call.get("function", {}) if isinstance(call, dict) else {}
+                raw_args = func_obj.get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args) if raw_args.strip() else {}
+                    except json.JSONDecodeError:
+                        raw_args = {}
+                try:
+                    validated_call = ToolCallPayload.model_validate({
+                        "name": func_obj.get("name", ""),
+                        "arguments": raw_args if isinstance(raw_args, dict) else {},
+                    })
+                    tool_name = validated_call.name
+                    tool_args = validated_call.arguments
+                except ValidationError as ve:
+                    tool_name = str(func_obj.get("name", "") or "")
+                    tool_args = {}
+                    emit_log(f"Tool call schema warning: {ve}")
 
                 emit_log(f"Ollama invoked tool: {tool_name}")
                 exec_info = self._invoke_tool(tool_name, tool_args)
@@ -1332,6 +2059,29 @@ class LocalAIAgent:
     ) -> Dict[str, Any]:
         """Wrapper method providing unified dict output for voice and server interfaces."""
         exec_res = self.execute(query, log_callback=log_callback, session_id=session_id)
+        return {
+            "query": query,
+            "response_text": exec_res.response,
+            "executed_tools": exec_res.tool_calls_made,
+            "execution_logs": exec_res.execution_logs,
+            "execution_time_ms": exec_res.execution_time_ms,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def stream_query(
+        self,
+        query: str,
+        on_clause: Callable[[str], None],
+        log_callback: Optional[Callable[[str], None]] = None,
+        session_id: str = "voice",
+    ) -> Dict[str, Any]:
+        """Stream response clauses to TTS immediately as punctuation boundaries arrive."""
+        exec_res = self.execute(
+            query,
+            log_callback=log_callback,
+            session_id=session_id,
+            on_clause=on_clause,
+        )
         return {
             "query": query,
             "response_text": exec_res.response,

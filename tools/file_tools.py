@@ -8,6 +8,8 @@ import sys
 import datetime
 import base64
 import logging
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, Any
 
@@ -249,3 +251,128 @@ def upload_save_file(
             "status": "error",
             "message": f"Failed to save file: {str(e)}"
         }
+
+
+def create_folder(folder_name: str = "", parent_dir: str = "desktop", **kwargs) -> Dict[str, Any]:
+    """Create a new folder on the local filesystem (defaults to Desktop).
+
+    Args:
+        folder_name: Name or relative path of the folder to create (e.g. 'AI', 'index.ai', 'Notes').
+        parent_dir: Target directory location: 'desktop', 'documents', 'downloads', or an absolute path.
+    """
+    name = (folder_name or kwargs.get("name") or kwargs.get("folder") or kwargs.get("path") or "").strip()
+    if not name:
+        return {"status": "error", "message": "No folder name specified to create."}
+
+    user_home = Path.home()
+    onedrive_dir = user_home / "OneDrive"
+    
+    target_parent = parent_dir.lower().strip()
+    if target_parent in ("desktop", "desktop/"):
+        # Match open_user_folder desktop resolution
+        candidate = onedrive_dir / "Desktop"
+        base_dir = candidate if candidate.is_dir() else (user_home / "Desktop")
+    elif target_parent in ("documents", "my documents", "documents/"):
+        candidate = onedrive_dir / "Documents"
+        base_dir = candidate if candidate.is_dir() else (user_home / "Documents")
+    elif target_parent in ("downloads", "downloads/"):
+        base_dir = user_home / "Downloads"
+    elif target_parent in ("home", "user", "~"):
+        base_dir = user_home
+    else:
+        # Check if parent_dir is a valid absolute/relative path
+        custom_path = Path(parent_dir).expanduser()
+        base_dir = custom_path if custom_path.is_absolute() else (user_home / custom_path)
+
+    try:
+        new_path = Path(name).expanduser()
+        if not new_path.is_absolute():
+            new_path = (base_dir / name).resolve()
+        
+        new_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created folder at '{new_path}'")
+        return {
+            "status": "success",
+            "message": f"Created folder '{new_path.name}' at '{new_path}'.",
+            "folder_path": str(new_path)
+        }
+    except Exception as e:
+        logger.error(f"Failed to create folder '{name}' in '{base_dir}': {e}")
+        return {
+            "status": "error",
+            "message": f"Could not create folder '{name}': {str(e)}"
+        }
+
+
+def download_file(url: str, destination_path: str = "desktop", filename: str = "") -> Dict[str, Any]:
+    """Download a file from a URL and save it to the specified path/folder.
+
+    Args:
+        url: Direct URL to the file to download (must start with http:// or https://).
+        destination_path: Destination folder. Use 'desktop', 'downloads', 'documents',
+                          or an absolute path. Defaults to Desktop.
+        filename: Optional filename to save as. If empty, inferred from URL.
+
+    Returns:
+        dict with status, file_path, size_bytes, message.
+    """
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return {"status": "error", "message": f"Invalid URL '{url}'. Must start with http:// or https://."}
+
+    # Resolve destination folder (mirrors create_folder logic)
+    user_home = Path.home()
+    onedrive_dir = user_home / "OneDrive"
+    dest_key = (destination_path or "desktop").lower().strip()
+
+    if dest_key in ("desktop", "desktop/"):
+        candidate = onedrive_dir / "Desktop"
+        base_dir = candidate if candidate.is_dir() else (user_home / "Desktop")
+    elif dest_key in ("documents", "my documents", "documents/"):
+        candidate = onedrive_dir / "Documents"
+        base_dir = candidate if candidate.is_dir() else (user_home / "Documents")
+    elif dest_key in ("downloads", "downloads/"):
+        base_dir = user_home / "Downloads"
+    elif dest_key in ("home", "user", "~"):
+        base_dir = user_home
+    else:
+        custom = Path(destination_path).expanduser()
+        base_dir = custom if custom.is_absolute() else (user_home / custom)
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Infer filename from URL if not provided
+    if not filename:
+        url_path = url.split("?")[0].rstrip("/")
+        filename = url_path.split("/")[-1] or "downloaded_file"
+    # Sanitize filename
+    filename = "".join(c for c in filename if c not in r'\/:*?"<>|').strip()
+    if not filename:
+        filename = "downloaded_file"
+
+    save_path = base_dir / filename
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = response.read()
+        with open(save_path, "wb") as f:
+            f.write(data)
+        size_bytes = len(data)
+        logger.info(f"Downloaded {url} → {save_path} ({size_bytes} bytes)")
+        return {
+            "status": "success",
+            "message": f"Downloaded and saved '{filename}' to '{save_path}' ({size_bytes:,} bytes).",
+            "file_path": str(save_path),
+            "size_bytes": size_bytes,
+        }
+    except urllib.error.HTTPError as e:
+        logger.error(f"HTTP error downloading '{url}': {e.code} {e.reason}")
+        return {"status": "error", "message": f"HTTP {e.code} error downloading file: {e.reason}"}
+    except urllib.error.URLError as e:
+        logger.error(f"URL error downloading '{url}': {e.reason}")
+        return {"status": "error", "message": f"Network error (are you offline?): {e.reason}"}
+    except Exception as e:
+        logger.error(f"Failed to download '{url}': {e}")
+        return {"status": "error", "message": f"Download failed: {str(e)}"}
+

@@ -6,10 +6,20 @@ opening any terminal console windows. Also manages runtime PID tracking so click
 the widget's '✕' Close Everything button cleanly shuts down every component it owns.
 """
 
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
+os.environ["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
+os.environ["OLLAMA_NUM_PARALLEL"] = "1"
+os.environ["OLLAMA_NOPRUNE"] = "1"
+
 import argparse
 import json
 import logging
-import os
 import shutil
 import signal
 import socket
@@ -23,6 +33,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from config import config
+
+_LOCAL_SESSION = requests.Session()
+_LOCAL_SESSION.trust_env = False
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_FILE = config.uploads_dir / "anureet_runtime.json"
@@ -111,7 +124,7 @@ def find_ollama_executable() -> Optional[str]:
 def is_ollama_online(base_url: Optional[str] = None, timeout: float = 1.5) -> bool:
     url = (base_url or config.ollama_base_url).rstrip("/")
     try:
-        resp = requests.get(f"{url}/api/tags", timeout=timeout)
+        resp = _LOCAL_SESSION.get(f"{url}/api/tags", timeout=timeout)
         return resp.status_code == 200
     except Exception:
         return False
@@ -122,9 +135,14 @@ def warmup_ollama_model(model_name: Optional[str] = None, base_url: Optional[str
     url = (base_url or config.ollama_base_url).rstrip("/")
     target_model = model_name or config.default_model
     try:
-        requests.post(
+        _LOCAL_SESSION.post(
             f"{url}/api/generate",
-            json={"model": target_model, "prompt": "", "keep_alive": "15m"},
+            json={
+                "model": target_model,
+                "prompt": "",
+                "keep_alive": "15m",
+                "options": {"num_ctx": 2048, "num_batch": 256, "num_thread": 6},
+            },
             timeout=25,
         )
     except Exception as e:
@@ -144,6 +162,16 @@ def ensure_ollama_running(timeout: float = 20.0) -> Tuple[Optional[int], bool]:
 
     logger.info(f"Starting headless Ollama server: {ollama_exe} serve")
     env = os.environ.copy()
+    env.update(
+        {
+            "OLLAMA_HOST": "127.0.0.1:11434",
+            "OLLAMA_FLASH_ATTENTION": "1",
+            "OLLAMA_KV_CACHE_TYPE": "q8_0",
+            "OLLAMA_MAX_LOADED_MODELS": "1",
+            "OLLAMA_NUM_PARALLEL": "1",
+            "OLLAMA_NOPRUNE": "1",
+        }
+    )
     env.setdefault("OLLAMA_KEEP_ALIVE", "15m")
     proc = subprocess.Popen(
         [ollama_exe, "serve"],
@@ -190,7 +218,7 @@ def _find_free_port(preferred_port: int = 8000, max_offset: int = 50) -> int:
 
 def is_gateway_online(port: int, timeout: float = 1.2) -> bool:
     try:
-        resp = requests.get(f"http://127.0.0.1:{port}/api/health", timeout=timeout)
+        resp = _LOCAL_SESSION.get(f"http://127.0.0.1:{port}/api/health", timeout=timeout)
         return resp.status_code == 200
     except Exception:
         return False
@@ -326,11 +354,16 @@ def request_full_shutdown(close_launched_apps: bool = False, delay_seconds: floa
 
 
 def _ensure_null_stdio() -> None:
-    """Guard pythonw.exe where sys.stdout / sys.stderr default to None."""
+    """Guard pythonw.exe where sys.stdout / sys.stderr / sys.stdin default to None."""
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdin is None:
+        try:
+            sys.stdin = open(os.devnull, "r", encoding="utf-8")
+        except Exception:
+            pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:

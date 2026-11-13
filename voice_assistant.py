@@ -3,6 +3,17 @@ Anureet - Offline Multilingual Local Voice AI Assistant powered by Faster-Whispe
 (multilingual 'small' model with CUDA auto-detection), Ollama, PyAutoGUI, and TTS.
 """
 
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
+os.environ["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
+os.environ["OLLAMA_NUM_PARALLEL"] = "1"
+os.environ["OLLAMA_NOPRUNE"] = "1"
+
 import asyncio
 import base64
 import ctypes
@@ -10,7 +21,7 @@ import difflib
 import io
 import json
 import logging
-import os
+import queue
 import re
 import socket
 import subprocess
@@ -20,6 +31,17 @@ import threading
 import time
 import wave
 from typing import Optional, Tuple
+from xml.sax.saxutils import escape as xml_escape
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdin is None:
+    try:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    except Exception:
+        pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] AnureetVoice: %(message)s")
 logger = logging.getLogger("AnureetVoice")
@@ -58,30 +80,27 @@ try:
 except ImportError:
     sr = None
 
-# 2. Audio Playback (Pygame)
+# 2. Offline Native Windows SAPI5 TTS (pywin32 COM STA Worker Thread, Zero Cloud Calls)
 try:
-    import pygame
-    pygame.mixer.init()
-except Exception:
-    pygame = None
+    import pythoncom
+    import win32com.client
+    SAPI5_AVAILABLE = True
+except ImportError:
+    pythoncom = None
+    win32com = None
+    SAPI5_AVAILABLE = False
 
-# 3. Offline TTS Engines
 try:
     import comtypes
     import comtypes.client
 except ImportError:
     comtypes = None
 
-try:
-    import pyttsx3
-except ImportError:
-    pyttsx3 = None
-pyttsx3_engine = None  # Never reuse a cross-thread COM STA pyttsx3 instance
-
-try:
-    import edge_tts
-except ImportError:
-    edge_tts = None
+SVSFlagsAsync = 1
+SVSFPurgeBeforeSpeak = 2
+SVSFIsXML = 8
+SRSE_IS_SPEAKING = 2
+_ONECORE_VOICES_CATEGORY = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices"
 
 from agent_core import agent
 from config import config
@@ -91,14 +110,14 @@ ASSISTANT_NAME = "Anureet"
 SESSION_TIMEOUT_SECONDS = 60
 
 WHISPER_INITIAL_PROMPT = (
-    "Anureet, Hey Anureet. Open notepad, open chrome, open youtube, open spotify, "
-    "weather, morning briefing, Bharat ki rajdhani kya hai, notepad kholo, "
-    "haan bhai, kya haal hai, samjhao, kaise ho."
+    "Anureet, Hey Anureet. CapCut, Google Chrome, Spotify, Notepad, YouTube, VS Code, "
+    "FL Studio, Premiere Pro, After Effects, Task Manager, File Explorer, Word, Excel, PowerPoint. "
+    "Click on, audio, create project, switch tab, next tab, new folder, minimize all, close window, "
+    "weather in Kurukshetra, Bharat ki rajdhani kya hai, notepad kholo, haan bhai, kya haal hai, samjhao, kaise ho."
 )
 
 LEADING_GREETINGS = {"hey", "hi", "hello", "ok", "okay", "sun", "suno", "oye"}
 DEVANAGARI_PATTERN = re.compile(r"[\u0900-\u097F]")
-_EDGE_TTS_COOLDOWN_UNTIL = 0.0
 
 _DEVANAGARI_CONSONANTS = {
     "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "ng",
@@ -184,24 +203,34 @@ def _build_wake_word_pattern() -> re.Pattern:
 
 WAKE_WORD_PATTERN = _build_wake_word_pattern()
 
+CONTINUOUS_START_PATTERN = re.compile(
+    r"^(?:anureet[,\s]+)?(?:please\s+)?(?:"
+    r"listen\s+continuously|continuous(?:ly)?\s+listen|"
+    r"start\s+continuous(?:\s+chat|\s+mode|\s+listening)?|"
+    r"continuous\s+(?:chat|mode|listening)|"
+    r"continuous\s+chat\s+mode|1\s*min(?:ute)?\s+continuous\s+chat|"
+    r"baat\s+karte\s+raho|continuous\s+suno"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+CONTINUOUS_STOP_PATTERN = re.compile(
+    r"^(?:anureet[,\s]+)?(?:please\s+)?(?:"
+    r"stop\s+continuous(?:\s+chat|\s+mode|\s+listening)?|"
+    r"exit\s+continuous(?:\s+chat|\s+mode)?|"
+    r"stop\s+listening\s+continuously|"
+    r"normal\s+mode|wake\s*word\s+mode|strict\s+mode|"
+    r"continuous\s+band\s+karo|bas\s+anureet"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
 _INTERNET_CACHE: Tuple[float, bool] = (0.0, False)
 
 
 def check_internet_connection(ttl_seconds: float = 60.0) -> bool:
-    """Check if internet is reachable, caching the result to avoid per-utterance stalls."""
-    global _INTERNET_CACHE
-    now = time.monotonic()
-    cached_until, cached_val = _INTERNET_CACHE
-    if now < cached_until:
-        return cached_val
-
-    try:
-        with socket.create_connection(("8.8.8.8", 53), timeout=1):
-            _INTERNET_CACHE = (now + ttl_seconds, True)
-            return True
-    except OSError:
-        _INTERNET_CACHE = (now + ttl_seconds, False)
-        return False
+    """Air-gapped mode: always returns False without opening any external socket."""
+    return False
 
 
 def _poll_cli_interrupt() -> bool:
@@ -218,43 +247,6 @@ def _poll_cli_interrupt() -> bool:
         return interrupted
     except Exception:
         return False
-
-
-def _ensure_pygame_mixer() -> bool:
-    """Initialize pygame.mixer lazily if pygame is available."""
-    if not pygame:
-        return False
-    if pygame.mixer.get_init():
-        return True
-    try:
-        pygame.mixer.init()
-        return bool(pygame.mixer.get_init())
-    except Exception:
-        return False
-
-
-def _play_audio_file(file_path: str, stop_event: Optional[threading.Event] = None) -> bool:
-    """Play an audio file synchronously via pygame mixer with <30ms speech interruption."""
-    if not _ensure_pygame_mixer():
-        return False
-    interrupted = False
-    try:
-        pygame.mixer.music.load(file_path)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            if (stop_event and stop_event.is_set()) or _poll_cli_interrupt():
-                pygame.mixer.music.stop()
-                if stop_event:
-                    stop_event.set()
-                interrupted = True
-                break
-            time.sleep(0.025)
-    finally:
-        try:
-            pygame.mixer.music.unload()
-        except Exception:
-            pass
-    return interrupted
 
 
 def _fuzzy_leading_wake_match(text: str, threshold: float = 0.75) -> Optional[str]:
@@ -304,11 +296,291 @@ class AnureetVoiceEngine:
         self.whisper_device = "cpu"
         self.whisper_compute_type = "int8"
         self._stop_speech_event = threading.Event()
+        self.is_speaking = threading.Event()
         self._stt_lock = threading.Lock()
         self._stt_initialized = False
 
+        # Dedicated COM STA SAPI5 worker thread + queue for non-blocking pipelined clauses & <5ms barge-in
+        self._tts_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._tts_done_event = threading.Event()
+        self._tts_done_event.set()
+        self._tts_voice = None
+        self._tts_selected_desc = ""
+        self._tts_worker_started = False
+        self._tts_worker_lock = threading.Lock()
+        self.continuous_chat_mode = False
+        self.continuous_chat_until = 0.0
+        self._start_tts_worker()
+
+    def start_continuous_mode(self, duration_seconds: float = 60.0) -> None:
+        """Activate 1-minute continuous chat mode where user can speak without repeating 'Anureet'."""
+        self.continuous_chat_mode = True
+        self.continuous_chat_until = time.time() + duration_seconds
+        logger.info(f"Continuous Chat Mode ACTIVATED for {int(duration_seconds)}s.")
+        self._emit_widget_event("continuous_chat", user_text="start", agent_text="Continuous chat mode activated.")
+
+    def stop_continuous_mode(self) -> None:
+        """Deactivate continuous chat mode and revert to strict wake-word mode ('Anureet ...')."""
+        self.continuous_chat_mode = False
+        self.continuous_chat_until = 0.0
+        logger.info("Continuous Chat Mode DEACTIVATED. Reverting to strict wake-word mode.")
+        self._emit_widget_event("continuous_chat", user_text="stop", agent_text="Continuous chat mode stopped.")
+
+    def is_continuous_mode_active(self) -> bool:
+        """Return True if 1-minute continuous chat mode is currently active and within time limit."""
+        if not self.continuous_chat_mode:
+            return False
+        if time.time() >= self.continuous_chat_until:
+            self.stop_continuous_mode()
+            return False
+        return True
+
         if init_stt and WHISPER_AVAILABLE:
             self.ensure_stt_loaded()
+
+    def _start_tts_worker(self) -> None:
+        """Start dedicated background COM STA SAPI5 speech worker thread once."""
+        if not (os.name == "nt" and SAPI5_AVAILABLE):
+            return
+        with self._tts_worker_lock:
+            if self._tts_worker_started:
+                return
+            worker = threading.Thread(target=self._sapi5_worker_loop, name="AnureetSAPI5Worker", daemon=True)
+            worker.start()
+            self._tts_worker_started = True
+
+    @staticmethod
+    def _collect_sapi5_tokens(voice) -> list:
+        """Collect voice tokens from Windows OneCore (includes Microsoft Heera en-IN) and classic SAPI5."""
+        tokens = []
+        cat = None
+        if win32com is not None:
+            try:
+                cat = win32com.client.Dispatch("SAPI.SpObjectTokenCategory")
+            except Exception:
+                cat = None
+        if cat is None and comtypes is not None:
+            try:
+                cat = comtypes.client.CreateObject("SAPI.SpObjectTokenCategory")
+            except Exception:
+                cat = None
+
+        if cat is not None:
+            try:
+                cat.SetId(_ONECORE_VOICES_CATEGORY, False)
+                oc_tokens = cat.EnumerateTokens()
+                for i in range(oc_tokens.Count):
+                    tokens.append(oc_tokens.Item(i))
+            except Exception as e:
+                logger.debug(f"OneCore SAPI5 voice scan skipped: {e}")
+
+        try:
+            std_tokens = voice.GetVoices()
+            for i in range(std_tokens.Count):
+                tokens.append(std_tokens.Item(i))
+        except Exception as e:
+            logger.debug(f"Classic SAPI5 voice scan skipped: {e}")
+        return tokens
+
+    @staticmethod
+    def _score_indian_female_token(desc: str, gender: str, lang: str) -> int:
+        low_desc = (desc or "").lower()
+        low_gender = (gender or "").lower()
+        low_lang = (lang or "").lower()
+
+        indian_female_names = ("heera", "kalpana", "neerja", "swara", "aditi", "raveena", "priya")
+        if any(n in low_desc for n in indian_female_names):
+            return 200
+        if low_gender == "female" and (
+            "india" in low_desc or "4009" in low_lang or "439" in low_lang or "en-in" in low_lang or "hi-in" in low_lang
+        ):
+            return 180
+        if low_gender == "female" or any(n in low_desc for n in ("zira", "female", "hazel", "susan")):
+            return 100
+        if low_gender == "male":
+            return -100
+        return 0
+
+    @classmethod
+    def _select_sapi5_female_voice(cls, voice) -> str:
+        """Select Indian Female voice (Microsoft Heera en-IN preferred) over OneCore/classic SAPI5."""
+        best_token = None
+        best_desc = ""
+        best_score = -1
+
+        try:
+            for tok in cls._collect_sapi5_tokens(voice):
+                try:
+                    desc = str(tok.GetDescription() or "")
+                except Exception:
+                    continue
+                try:
+                    gender = str(tok.GetAttribute("Gender") or "")
+                except Exception:
+                    gender = ""
+                try:
+                    lang = str(tok.GetAttribute("Language") or "")
+                except Exception:
+                    lang = ""
+                score = cls._score_indian_female_token(desc, gender, lang)
+                if score > best_score:
+                    best_score = score
+                    best_token = tok
+                    best_desc = desc
+
+            if best_token is not None:
+                voice.Voice = best_token
+                logger.info(f"Selected Offline Female Voice: {best_desc}")
+                return best_desc.lower()
+        except Exception as e:
+            logger.debug(f"SAPI5 female voice selection skipped: {e}")
+        return ""
+
+    @staticmethod
+    def _format_soft_indian_ssml(spoken_text: str) -> str:
+        """Wrap spoken text in gentle SAPI5 XML prosody for a soft, clear delivery."""
+        safe = xml_escape(spoken_text)
+        return f'<pitch absmiddle="+1"><rate absspeed="0">{safe}</rate></pitch>'
+
+    def _prepare_spoken_text(self, text: str) -> str:
+        clean_text = str(text or "").replace("*", "").strip()
+        if not clean_text:
+            return ""
+        if DEVANAGARI_PATTERN.search(clean_text) and not any(
+            h in getattr(self, "_tts_selected_desc", "") for h in ("kalpana", "hemant", "hindi", "hi-in")
+        ):
+            return _devanagari_to_hinglish(clean_text)
+        return clean_text
+
+
+    @classmethod
+    def synthesize_offline_female_wav(cls, text: str) -> bytes:
+        """Synthesize text offline using Windows OneCore / SAPI5 Microsoft Heera into WAV audio bytes."""
+        clean = str(text or "").replace("*", "").strip()
+        if not clean:
+            return b""
+        if DEVANAGARI_PATTERN.search(clean):
+            clean = _devanagari_to_hinglish(clean)
+
+        com_init = False
+        try:
+            pythoncom.CoInitialize()
+            com_init = True
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            cls._select_sapi5_female_voice(voice)
+            voice.Rate = 0
+            voice.Volume = 95
+            stream = win32com.client.Dispatch("SAPI.SpFileStream")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                # 3 = SSFMCreateForWrite
+                stream.Open(tmp_path, 3)
+                voice.AudioOutputStream = stream
+                safe_text = xml_escape(clean)
+                ssml = f'<pitch absmiddle="+1"><rate absspeed="0">{safe_text}</rate></pitch>'
+                voice.Speak(ssml, SVSFIsXML)
+                stream.Close()
+                with open(tmp_path, "rb") as f:
+                    return f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning(f"Offline female WAV synthesis error: {e}")
+            return b""
+        finally:
+            if com_init:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    def _sapi5_worker_loop(self) -> None:
+        """Background COM STA thread running SAPI.SpVoice asynchronously with instant purge support."""
+        com_init = False
+        voice = None
+        try:
+            pythoncom.CoInitialize()
+            com_init = True
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            self._tts_selected_desc = self._select_sapi5_female_voice(voice)
+            voice.Rate = 0
+            voice.Volume = 92
+            self._tts_voice = voice
+
+            while True:
+                item = self._tts_queue.get()
+                try:
+                    if item is None:
+                        break
+                    if self._stop_speech_event.is_set():
+                        continue
+                    spoken = self._prepare_spoken_text(item)
+                    if not spoken:
+                        continue
+                    self.is_speaking.set()
+                    self._tts_done_event.clear()
+                    voice.Speak(self._format_soft_indian_ssml(spoken), SVSFlagsAsync | SVSFIsXML)
+
+                    # Poll WaitUntilDone in 35ms slices for <35ms Esc / barge-in cancellation
+                    loop_start = time.monotonic()
+                    max_duration = max(10.0, len(spoken) * 0.16 + 5.0)
+                    while not self._stop_speech_event.is_set():
+                        if _poll_cli_interrupt():
+                            self._stop_speech_event.set()
+                            break
+                        try:
+                            finished = voice.WaitUntilDone(35)
+                        except Exception:
+                            finished = True
+                        if finished:
+                            break
+                        if time.monotonic() - loop_start >= max_duration:
+                            logger.debug("TTS playback reached safety watchdog threshold.")
+                            break
+
+                    if self._stop_speech_event.is_set():
+                        try:
+                            voice.Speak("", SVSFPurgeBeforeSpeak)
+                        except Exception:
+                            pass
+                finally:
+                    if self._tts_queue.empty():
+                        self.is_speaking.clear()
+                        self._tts_done_event.set()
+                    self._tts_queue.task_done()
+        except Exception as e:
+            logger.error(f"SAPI5 worker loop failed: {e}")
+        finally:
+            self.is_speaking.clear()
+            self._tts_done_event.set()
+            self._tts_voice = None
+            if com_init:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    def is_speaking_active(self) -> bool:
+        """Echo guard check: True while SAPI5 is actively speaking or draining queued clauses."""
+        if getattr(self, "is_speaking", None) and self.is_speaking.is_set():
+            return True
+        q = getattr(self, "_tts_queue", None)
+        if q is not None and not q.empty():
+            return True
+        voice = getattr(self, "_tts_voice", None)
+        if voice is not None:
+            try:
+                return not voice.WaitUntilDone(0)
+            except Exception:
+                try:
+                    return getattr(voice.Status, "RunningState", 0) in (0, 2)
+                except Exception:
+                    return False
+        return False
 
     def ensure_stt_loaded(self) -> None:
         """Load Faster-Whisper lazily once without blocking TTS startup."""
@@ -322,18 +594,26 @@ class AnureetVoiceEngine:
             self._stt_initialized = True
 
     def stop_speaking(self) -> None:
-        """Immediately halt any active TTS playback (<30ms cutoff)."""
+        """Immediately halt any active TTS playback (<5ms SVSFPurgeBeforeSpeak barge-in)."""
         self._stop_speech_event.set()
-        if pygame and pygame.mixer.get_init():
+        q = getattr(self, "_tts_queue", None)
+        if q is not None:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                except Exception:
+                    break
+        voice = getattr(self, "_tts_voice", None)
+        if voice is not None:
             try:
-                pygame.mixer.music.stop()
+                voice.Speak("", SVSFPurgeBeforeSpeak)
             except Exception:
                 pass
-        if pyttsx3_engine:
-            try:
-                pyttsx3_engine.stop()
-            except Exception:
-                pass
+        if getattr(self, "is_speaking", None) is not None:
+            self.is_speaking.clear()
+        if getattr(self, "_tts_done_event", None) is not None:
+            self._tts_done_event.set()
 
     @staticmethod
     def _create_recognizer():
@@ -387,52 +667,43 @@ class AnureetVoiceEngine:
         audio_f32 = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         speech_chunks = get_speech_timestamps(
             audio_f32,
-            vad_options=VadOptions(min_silence_duration_ms=300),
+            vad_options=VadOptions(threshold=0.52, min_speech_duration_ms=180, min_silence_duration_ms=300),
             sampling_rate=sample_rate,
         )
-        return bool(speech_chunks)
+        if not speech_chunks:
+            return False
+        voiced_samples = sum(max(0, int(c.get("end", 0)) - int(c.get("start", 0))) for c in speech_chunks if isinstance(c, dict))
+        if speech_chunks and voiced_samples > 0 and voiced_samples < int(sample_rate * 0.15):
+            return False
+        return True
 
     @staticmethod
     def _cpu_threads() -> int:
-        return min(8, max(4, os.cpu_count() or 4))
+        return 4
 
     def _init_whisper_model(self) -> None:
+        """Load Faster-Whisper strictly offline on CPU int8 (0 MB VRAM, no HF network calls)."""
         model_name = config.whisper_model_name
-        device = config.whisper_device
-        compute_type = config.whisper_compute_type
-
-        if device == "auto":
-            attempts = (
-                [("cuda", "int8_float16" if compute_type == "auto" else compute_type), ("cpu", "int8")]
-                if self._is_cuda_usable()
-                else [("cpu", "int8" if compute_type == "auto" else compute_type)]
+        dev = "cpu"
+        ct = "int8"
+        try:
+            logger.info(
+                f"Initializing Offline Faster-Whisper '{model_name}' "
+                f"(device={dev}, compute_type={ct}, cpu_threads=4, local_files_only=True)..."
             )
-        else:
-            resolved_ct = compute_type if compute_type != "auto" else ("int8_float16" if device == "cuda" else "int8")
-            attempts = [(device, resolved_ct)]
-
-        for dev, ct in attempts:
-            try:
-                logger.info(f"Initializing Faster-Whisper '{model_name}' (device={dev}, compute_type={ct})...")
-                init_kwargs = {"device": dev, "compute_type": ct}
-                if dev == "cpu":
-                    init_kwargs["cpu_threads"] = self._cpu_threads()
-                candidate = WhisperModel(model_name, **init_kwargs)
-                if dev == "cuda":
-                    # Probe CUDA runtime DLLs (cuBLAS/cuDNN) early before accepting CUDA.
-                    segs, _ = candidate.transcribe(
-                        io.BytesIO(self._silent_wav_bytes()),
-                        beam_size=1,
-                        vad_filter=False,
-                    )
-                    list(segs)
-                self.whisper_model = candidate
-                self.whisper_device = dev
-                self.whisper_compute_type = ct
-                logger.info(f"Faster-Whisper '{model_name}' loaded successfully on {dev}!")
-                return
-            except Exception as e:
-                logger.warning(f"Faster-Whisper init/probe failed on {dev} ({ct}): {e}")
+            candidate = WhisperModel(
+                model_name,
+                device=dev,
+                compute_type=ct,
+                cpu_threads=4,
+                local_files_only=True,
+            )
+            self.whisper_model = candidate
+            self.whisper_device = dev
+            self.whisper_compute_type = ct
+            logger.info(f"Faster-Whisper '{model_name}' loaded successfully on {dev}!")
+        except Exception as e:
+            logger.warning(f"Offline Faster-Whisper init failed on {dev} ({ct}): {e}; falling back to local Vosk model/.")
 
     def _run_whisper_decode(self, wav_bytes: bytes, kwargs: dict) -> str:
         segments, info = self.whisper_model.transcribe(io.BytesIO(wav_bytes), **kwargs)
@@ -448,13 +719,32 @@ class AnureetVoiceEngine:
                 **dict(kwargs, language=fallback_lang),
             )
             seg_list = list(segments)
-        return " ".join(segment.text for segment in seg_list).strip()
+        kept_texts: list[str] = []
+        for segment in seg_list:
+            nsp = getattr(segment, "no_speech_prob", None)
+            alp = getattr(segment, "avg_logprob", None)
+            cr = getattr(segment, "compression_ratio", None)
+            if isinstance(nsp, (int, float)) and nsp > 0.70:
+                continue
+            if isinstance(alp, (int, float)) and alp < -1.1:
+                continue
+            if isinstance(cr, (int, float)) and cr > 2.4:
+                continue
+            text_part = str(getattr(segment, "text", "") or "").strip()
+            if text_part:
+                kept_texts.append(text_part)
+        return " ".join(kept_texts).strip()
 
     def _transcribe_whisper(self, wav_bytes: bytes) -> str:
         """Transcribe WAV audio bytes using Faster-Whisper with fast silence skip and wake-word biasing."""
         if not self._has_speech(wav_bytes):
             return ""
 
+        hotwords_list = [
+            "Anureet", "Hey Anureet", "CapCut", "Chrome", "Spotify", "Notepad",
+            "YouTube", "VS Code", "FL Studio", "Premiere", "Audio", "Click",
+            "Switch tab", "New folder", "Minimize", "Close",
+        ]
         kwargs = {
             "language": config.whisper_language,
             "multilingual": False,
@@ -466,7 +756,7 @@ class AnureetVoiceEngine:
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.6,
             "initial_prompt": WHISPER_INITIAL_PROMPT,
-            "hotwords": "Anureet, Hey Anureet",
+            "hotwords": ", ".join(hotwords_list),
         }
         try:
             return self._run_whisper_decode(wav_bytes, kwargs)
@@ -476,7 +766,6 @@ class AnureetVoiceEngine:
             if (
                 WhisperModel is not None
                 and getattr(self, "whisper_device", "cpu") == "cuda"
-                and config.whisper_device == "auto"
                 and is_cuda_runtime_err
             ):
                 logger.warning(f"CUDA transcription failed ({e}); falling back to CPU (int8)...")
@@ -484,7 +773,8 @@ class AnureetVoiceEngine:
                     config.whisper_model_name,
                     device="cpu",
                     compute_type="int8",
-                    cpu_threads=self._cpu_threads(),
+                    cpu_threads=4,
+                    local_files_only=True,
                 )
                 self.whisper_device = "cpu"
                 self.whisper_compute_type = "int8"
@@ -505,26 +795,41 @@ class AnureetVoiceEngine:
         en_prob = float(all_probs.get("en", 0.0))
         return "hi" if hi_prob > en_prob else "en"
 
-    @staticmethod
-    def extract_wake_command(text: str, active_session_until: float, now: Optional[float] = None) -> Tuple[bool, str]:
-        """Determine whether a transcript triggers Anureet and extract the command string."""
+    @classmethod
+    def extract_wake_command(
+        cls,
+        text: str,
+        active_session_until: float = 0.0,
+        now: Optional[float] = None,
+        continuous_mode: Optional[bool] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Determine whether a transcript triggers Anureet and extract the command string.
+        - Strict Command Mode (default): NO execution unless 'Anureet' is spoken at the start.
+        - 1-Minute Continuous Chat Mode: Any utterance within the active window executes without saying 'Anureet'.
+        """
         cleaned = (text or "").strip()
         if not cleaned:
             return False, ""
 
+        # 1. Exact or variant wake word match: "Anureet <command>"
         match = WAKE_WORD_PATTERN.search(cleaned)
         if match:
             command_part = cleaned[match.end():].lstrip(" ,.:;!?-").strip()
             return True, command_part
 
+        # 2. Leading phonetic fuzzy match: "Anurit <command>"
         fuzzy_cmd = _fuzzy_leading_wake_match(cleaned)
         if fuzzy_cmd is not None:
             return True, fuzzy_cmd
 
+        # 3. 1-Minute Continuous Chat Mode check
         current_time = time.time() if now is None else now
-        if current_time < active_session_until:
+        is_continuous = continuous_mode if continuous_mode is not None else (current_time < active_session_until)
+        if is_continuous:
             return True, cleaned
 
+        # Default strict mode: No execution without wake word
         return False, ""
 
     @staticmethod
@@ -535,7 +840,21 @@ class AnureetVoiceEngine:
             logger.debug(f"Widget event sync skipped: {e}")
 
     def _handle_command(self, command_part: str) -> float:
-        """Execute an extracted voice command (or prompt for follow-up) and update session deadline."""
+        """Execute an extracted voice command with streaming clause-by-clause SAPI5 TTS."""
+        if command_part == "__continuous_start__":
+            reply = "Continuous listening mode activated for 1 minute. You can speak freely without saying Anureet."
+            self._emit_widget_event("speaking", user_text="listen continuously", agent_text=reply)
+            self.speak(reply)
+            self._emit_widget_event("idle", user_text="listen continuously", agent_text=reply)
+            return self.continuous_chat_until
+
+        if command_part == "__continuous_stop__":
+            reply = "Continuous chat mode ended. Back to strict wake word mode."
+            self._emit_widget_event("speaking", user_text="stop continuous mode", agent_text=reply)
+            self.speak(reply)
+            self._emit_widget_event("idle", user_text="stop continuous mode", agent_text=reply)
+            return 0.0
+
         if (
             not command_part
             or len(command_part) < 2
@@ -545,259 +864,112 @@ class AnureetVoiceEngine:
             self._emit_widget_event("speaking", user_text="Anureet", agent_text=prompt)
             self.speak(prompt)
             self._emit_widget_event("idle", user_text="Anureet", agent_text=prompt)
-            return time.time() + SESSION_TIMEOUT_SECONDS
+            return self.continuous_chat_until if self.is_continuous_mode_active() else 0.0
 
         print(f"\n[Anureet Active 🎙️] Executing: '{command_part}'")
         self._emit_widget_event("thinking", user_text=command_part)
-        res_dict = agent.process_query(command_part, session_id="voice")
+        self.begin_speech_turn()
+        spoke_any = False
+
+        def on_stream_clause(clause: str) -> None:
+            nonlocal spoke_any
+            if not clause or self._stop_speech_event.is_set():
+                return
+            if not spoke_any:
+                spoke_any = True
+                self._emit_widget_event("speaking", user_text=command_part, agent_text=clause)
+            self.speak_clause(clause)
+
+        res_dict = agent.stream_query(command_part, on_clause=on_stream_clause, session_id="voice")
         response = res_dict.get("response_text", "")
-
         print(f"[Anureet Response 🗣️]: {response}\n")
-        if response:
-            self._emit_widget_event("speaking", user_text=command_part, agent_text=response)
-            self.speak(response)
-        self._emit_widget_event("idle", user_text=command_part, agent_text=response)
-        return time.time() + SESSION_TIMEOUT_SECONDS
 
-    def speak(self, text: str):
-        """Synthesize and speak text aloud with <30ms Esc/q/Ctrl+D interruption support."""
-        global _EDGE_TTS_COOLDOWN_UNTIL
-        logger.info(f"Anureet Speaking: {text}")
-        clean_text = str(text).replace("*", "").strip()
-        if not clean_text:
-            return
+        if response and not self._stop_speech_event.is_set():
+            self._emit_widget_event("speaking", user_text=command_part, agent_text=response)
+            if not spoke_any:
+                self.speak(response)
+            else:
+                self.wait_until_done_speaking()
+        else:
+            self.wait_until_done_speaking()
+
+        self._emit_widget_event("idle", user_text=command_part, agent_text=response)
+        if self.is_continuous_mode_active():
+            return self.continuous_chat_until
+        return 0.0
+
+    def begin_speech_turn(self) -> None:
+        """Reset barge-in stop flag at the start of a new response turn."""
         self._stop_speech_event.clear()
 
-        # 1. Try Piper Neural TTS (100% Offline Human Neural Voice)
-        if os.path.exists(self.piper_model_path):
-            try:
-                self._speak_piper_tts(clean_text)
-                return
-            except Exception as e:
-                logger.warning(f"Piper TTS playback failed: {e}. Trying fallback TTS...")
-
-        # 2. Try Edge-TTS (Only if Internet is Connected & Not in Error Cooldown)
-        now = time.monotonic()
-        if (
-            not self._stop_speech_event.is_set()
-            and edge_tts
-            and now >= _EDGE_TTS_COOLDOWN_UNTIL
-            and check_internet_connection()
-        ):
-            try:
-                asyncio.run(asyncio.wait_for(self._speak_edge_tts(clean_text), timeout=6.0))
-                return
-            except Exception as e:
-                _EDGE_TTS_COOLDOWN_UNTIL = time.monotonic() + 600.0
-                logger.warning(f"Edge-TTS unavailable ({e}); falling back to offline voice for 10m.")
-
-        if self._stop_speech_event.is_set():
+    def speak_clause(self, clause: str) -> None:
+        """Enqueue a single spoken clause onto the background SAPI5 COM STA worker without blocking."""
+        clean_clause = str(clause or "").replace("*", "").strip()
+        if not clean_clause or self._stop_speech_event.is_set():
             return
+        self._start_tts_worker()
+        if getattr(self, "_tts_worker_started", False):
+            self._tts_done_event.clear()
+            self._tts_queue.put(clean_clause)
+        elif os.name == "nt" and comtypes is not None:
+            self._speak_sapi_comtypes_fallback(clean_clause)
 
-        # 3. Offline Windows WinRT Neural-Quality Indian Voice (Microsoft Heera en-IN -> WAV -> Pygame)
-        if os.name == "nt":
-            try:
-                self._speak_winrt_wav(clean_text)
-                return
-            except Exception as e:
-                logger.warning(f"WinRT Heera WAV synthesis failed: {e}. Trying SAPI WAV...")
-
-        if self._stop_speech_event.is_set():
+    def wait_until_done_speaking(self, timeout: Optional[float] = None) -> None:
+        """Wait until queued SAPI5 clauses finish speaking or barge-in cancels playback."""
+        done_ev = getattr(self, "_tts_done_event", None)
+        if done_ev is None:
             return
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        while not done_ev.is_set():
+            if self._stop_speech_event.is_set() or _poll_cli_interrupt():
+                self.stop_speaking()
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            done_ev.wait(timeout=0.025)
 
-        # 4. Thread-Safe Offline Windows COM SAPI5 -> WAV -> Pygame Mixer (<30ms Esc Interrupt)
-        if os.name == "nt" and comtypes is not None:
-            try:
-                self._speak_sapi_wav(clean_text)
-                return
-            except Exception as e:
-                logger.warning(f"SAPI WAV synthesis failed: {e}. Trying PowerShell SAPI...")
+    def speak(self, text: str, blocking: bool = True):
+        """Speak text via offline Windows SAPI5 async worker with <5ms barge-in support."""
+        logger.info(f"Anureet Speaking: {text}")
+        clean_text = str(text or "").replace("*", "").strip()
+        if not clean_text:
+            return
+        self.begin_speech_turn()
+        self.speak_clause(clean_text)
+        if blocking:
+            self.wait_until_done_speaking()
 
-        # 5. Windows Native PowerShell SAPI5 TTS Fallback (also thread-safe isolated process)
-        if os.name == "nt":
-            try:
-                spoken_text = _devanagari_to_hinglish(clean_text)
-                literal_text = spoken_text.replace("'", "''")
-                ps_script = (
-                    "Add-Type -AssemblyName System.Speech; "
-                    "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                    "$v = $synth.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Gender -eq 'Female' } | Select-Object -First 1; "
-                    "if ($v) { $synth.SelectVoice($v.VoiceInfo.Name) }; "
-                    f"$synth.Speak('{literal_text}'); "
-                    "$synth.Dispose()"
-                )
-                encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                return
-            except Exception as e:
-                logger.error(f"PowerShell TTS failed: {e}")
-
-        # 6. Non-Windows / generic thread-local pyttsx3 fallback
-        if pyttsx3 is not None:
-            try:
-                engine = pyttsx3.init()
-                engine.setProperty("rate", 170)
-                engine.say(clean_text)
-                engine.runAndWait()
-            except Exception as e:
-                logger.error(f"pyttsx3 speak failed: {e}")
-
-    def _speak_winrt_wav(self, text: str) -> None:
-        """Synthesize offline Windows WinRT SpeechSynthesizer (Microsoft Heera en-IN) into WAV."""
-        if not _ensure_pygame_mixer():
-            raise RuntimeError("pygame mixer unavailable")
-
-        spoken_text = _devanagari_to_hinglish(text) if DEVANAGARI_PATTERN.search(text) else text
-        literal_text = spoken_text.replace("'", "''")
-        wav_path = None
+    def _speak_sapi_comtypes_fallback(self, text: str) -> None:
+        """Offline SAPI5 fallback if pywin32 worker is unavailable."""
+        com_init = False
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                wav_path = tmp.name
-
-            wav_escaped = wav_path.replace("'", "''")
-            ps_script = (
-                "$ErrorActionPreference = 'Stop'; "
-                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-                "[Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime] | Out-Null; "
-                "[Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime] | Out-Null; "
-                "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | "
-                "Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
-                "Function Await($op, $resType) { "
-                "$netTask = $asTaskGeneric.MakeGenericMethod($resType).Invoke($null, @($op)); "
-                "$netTask.Wait(-1) | Out-Null; "
-                "$netTask.Result "
-                "}; "
-                "$synth = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer; "
-                "$voice = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object { $_.DisplayName -like '*Heera*' -or $_.Language -like 'en-IN*' } | Select-Object -First 1; "
-                "if ($voice) { $synth.Voice = $voice }; "
-                "try { $synth.Options.SpeakingRate = 1.04 } catch {}; "
-                f"$stream = Await ($synth.SynthesizeTextToStreamAsync('{literal_text}')) ([Windows.Media.SpeechSynthesis.SpeechSynthesisStream]); "
-                "$size = [uint32]$stream.Size; "
-                "$reader = New-Object Windows.Storage.Streams.DataReader($stream); "
-                "Await ($reader.LoadAsync($size)) ([uint32]) | Out-Null; "
-                "$bytes = New-Object byte[] $size; "
-                "$reader.ReadBytes($bytes); "
-                f"[System.IO.File]::WriteAllBytes('{wav_escaped}', $bytes); "
-                "$reader.Dispose(); $stream.Dispose(); $synth.Dispose()"
-            )
-            encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if res.returncode != 0:
-                raise RuntimeError((res.stderr or res.stdout or f"exit {res.returncode}").strip())
-            if self._stop_speech_event.is_set():
-                return
-            if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
-                raise RuntimeError("WinRT Heera produced empty WAV output")
-            _play_audio_file(wav_path, stop_event=self._stop_speech_event)
-        finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-
-    def _speak_sapi_wav(self, text: str) -> None:
-        """Synthesize offline Windows SAPI5 speech into WAV and play via pygame mixer."""
-        if not _ensure_pygame_mixer():
-            raise RuntimeError("pygame mixer unavailable")
-
-        wav_path = None
-        com_initialized = False
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                wav_path = tmp.name
-
             comtypes.CoInitialize()
-            com_initialized = True
+            com_init = True
             voice = comtypes.client.CreateObject("SAPI.SpVoice")
-            voices = voice.GetVoices()
-            selected_desc = ""
-            for i in range(voices.Count):
-                desc = voices.Item(i).GetDescription()
-                low = desc.lower()
-                if any(name in low for name in ("heera", "neerja", "swara", "kalpana", "zira", "female")):
-                    voice.Voice = voices.Item(i)
-                    selected_desc = low
+            selected_desc = self._select_sapi5_female_voice(voice)
+            spoken = (
+                _devanagari_to_hinglish(text)
+                if DEVANAGARI_PATTERN.search(text) and not any(h in selected_desc for h in ("kalpana", "hemant", "hindi", "hi-in"))
+                else text
+            )
+            voice.Rate = 0
+            voice.Volume = 92
+            voice.Speak(self._format_soft_indian_ssml(spoken), SVSFlagsAsync | SVSFIsXML)
+            while not self._stop_speech_event.is_set():
+                if _poll_cli_interrupt():
+                    self._stop_speech_event.set()
                     break
-
-            speak_text = text
-            if DEVANAGARI_PATTERN.search(text) and not any(h in selected_desc for h in ("kalpana", "hemant", "hindi", "hi-in")):
-                speak_text = _devanagari_to_hinglish(text)
-
-            stream = comtypes.client.CreateObject("SAPI.SpFileStream")
-            stream.Open(wav_path, 3, False)
-            voice.AudioOutputStream = stream
-            voice.Rate = 1
-            voice.Speak(speak_text, 0)
-            stream.Close()
-
+                if voice.WaitUntilDone(25):
+                    break
             if self._stop_speech_event.is_set():
-                return
-            if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
-                raise RuntimeError("SAPI produced empty WAV output")
-            _play_audio_file(wav_path, stop_event=self._stop_speech_event)
+                voice.Speak("", SVSFPurgeBeforeSpeak)
+        except Exception as e:
+            logger.error(f"Offline comtypes SAPI5 fallback failed: {e}")
         finally:
-            if com_initialized:
+            if com_init:
                 try:
                     comtypes.CoUninitialize()
                 except Exception:
-                    pass
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-
-    def _speak_piper_tts(self, text: str):
-        wav_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                wav_path = tmp.name
-            subprocess.run(
-                ["piper", "--model", self.piper_model_path, "--output_file", wav_path],
-                input=text,
-                text=True,
-                check=True,
-            )
-            _play_audio_file(wav_path, stop_event=self._stop_speech_event)
-        finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-
-    async def _speak_edge_tts(self, text: str):
-        if pygame and pygame.mixer.get_init():
-            try:
-                pygame.mixer.music.unload()
-            except Exception:
-                pass
-
-        voice = "hi-IN-SwaraNeural" if DEVANAGARI_PATTERN.search(text) else "en-IN-NeerjaNeural"
-        mp3_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                mp3_path = tmp.name
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(mp3_path)
-            if os.path.getsize(mp3_path) > 0:
-                _play_audio_file(mp3_path, stop_event=self._stop_speech_event)
-        finally:
-            if mp3_path and os.path.exists(mp3_path):
-                try:
-                    os.remove(mp3_path)
-                except OSError:
                     pass
 
     @staticmethod
@@ -808,8 +980,29 @@ class AnureetVoiceEngine:
         except Exception:
             return sr.Microphone()
 
+    def _transcribe_vosk_wav(self, wav_bytes: bytes) -> str:
+        """Offline transcription using local Kaldi/Vosk acoustic files inside model/."""
+        vosk_model_path = os.path.abspath("model")
+        if not (VOSK_AVAILABLE and os.path.exists(vosk_model_path)):
+            return ""
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                pcm = wf.readframes(wf.getnframes())
+                sample_rate = wf.getframerate() or 16000
+            model = getattr(self, "_vosk_model", None)
+            if model is None:
+                model = VoskModel(vosk_model_path)
+                self._vosk_model = model
+            rec = KaldiRecognizer(model, sample_rate)
+            rec.AcceptWaveform(pcm)
+            res = json.loads(rec.FinalResult())
+            return str(res.get("text", "")).strip()
+        except Exception as e:
+            logger.debug(f"Offline Vosk single-shot decode failed: {e}")
+            return ""
+
     def listen_once(self, timeout: int = 6, phrase_time_limit: int = 10) -> str:
-        """Capture and transcribe a single voice utterance using Faster-Whisper or SpeechRecognition."""
+        """Capture and transcribe a single voice utterance strictly offline (Whisper or local Vosk)."""
         if not self.recognizer:
             return ""
         self.ensure_stt_loaded()
@@ -817,10 +1010,17 @@ class AnureetVoiceEngine:
             with self._open_microphone() as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.35)
                 audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
             if WHISPER_AVAILABLE and self.whisper_model:
-                return self._transcribe_whisper(audio.get_wav_data())
-            raw_text = self.recognizer.recognize_google(audio, language="en-IN")
-            return str(raw_text[0]) if isinstance(raw_text, list) and raw_text else str(raw_text)
+                return self._transcribe_whisper(wav_bytes)
+            if hasattr(self.recognizer, "recognize_vosk"):
+                try:
+                    raw_vosk = self.recognizer.recognize_vosk(audio)
+                    parsed = json.loads(raw_vosk) if raw_vosk else {}
+                    return str(parsed.get("text", "")).strip()
+                except Exception:
+                    pass
+            return self._transcribe_vosk_wav(wav_bytes)
         except Exception as e:
             logger.debug(f"Single-shot listen skipped/timed out: {e}")
             return ""
@@ -849,9 +1049,9 @@ class AnureetVoiceEngine:
             self._listen_vosk(vosk_model_path, active_session_until)
             return
 
-        # Option C: SpeechRecognition Fallback
-        if sr:
-            logger.info("Starting SpeechRecognition Listener...")
+        # Option C: Offline SpeechRecognition + local Vosk Fallback (never Google cloud API)
+        if sr and VOSK_AVAILABLE and os.path.exists(vosk_model_path):
+            logger.info("Starting Offline SpeechRecognition + local Vosk Listener...")
             self._listen_speech_recognition(active_session_until)
 
     @staticmethod
@@ -880,22 +1080,25 @@ class AnureetVoiceEngine:
         try:
             return self._handle_command(command_part)
         finally:
-            time.sleep(0.25)
+            self.wait_until_done_speaking()
+            # 300ms acoustic grace period to absorb room reverberation & prevent audio clipping
+            time.sleep(0.30)
             resume_fn()
 
-    def _listen_whisper(self, active_session_until: float):
+    def _listen_whisper(self, active_session_until: float = 0.0):
         with self._open_microphone() as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
             logger.info("Microphone calibrated for ambient noise.")
 
             while True:
                 try:
-                    now = time.time()
-                    if now < active_session_until:
-                        logger.info(f"Conversational Follow-Up Mode Active ({int(active_session_until - now)}s remaining)...")
-                        self._emit_widget_event("listening")
+                    is_continuous = self.is_continuous_mode_active()
+                    if is_continuous:
+                        rem = max(0, int(self.continuous_chat_until - time.time()))
+                        logger.info(f"1-Minute Continuous Chat Mode Active ({rem}s remaining)...")
+                        self._emit_widget_event("listening", user_text="Continuous Chat Active")
                     else:
-                        logger.info("Listening for wake word 'Anureet'...")
+                        logger.info("Strict Command Mode: Listening for 'Anureet <command>'...")
 
                     audio = self.recognizer.listen(source, timeout=8, phrase_time_limit=12)
                     text = self._transcribe_whisper(audio.get_wav_data())
@@ -903,18 +1106,41 @@ class AnureetVoiceEngine:
                         continue
 
                     logger.info(f"Heard (Faster-Whisper): '{text}'")
-                    wake_found, command_part = self.extract_wake_command(text, active_session_until)
+
+                    # Check for explicit continuous mode commands
+                    if CONTINUOUS_START_PATTERN.search(text):
+                        self.start_continuous_mode(60.0)
+                        self._run_command_with_mic_paused(
+                            "__continuous_start__",
+                            lambda: self._pause_mic_stream(source),
+                            lambda: self._resume_mic_stream(source),
+                        )
+                        continue
+
+                    if CONTINUOUS_STOP_PATTERN.search(text):
+                        self.stop_continuous_mode()
+                        self._run_command_with_mic_paused(
+                            "__continuous_stop__",
+                            lambda: self._pause_mic_stream(source),
+                            lambda: self._resume_mic_stream(source),
+                        )
+                        continue
+
+                    wake_found, command_part = self.extract_wake_command(
+                        text,
+                        continuous_mode=is_continuous,
+                    )
                     if wake_found:
-                        active_session_until = self._run_command_with_mic_paused(
+                        self._run_command_with_mic_paused(
                             command_part,
                             lambda: self._pause_mic_stream(source),
                             lambda: self._resume_mic_stream(source),
                         )
 
                 except sr.WaitTimeoutError:
-                    if time.time() >= active_session_until > 0:
-                        logger.info("Conversational session idle for 1 minute. Reverting to background wake-word listening.")
-                        active_session_until = 0.0
+                    if self.continuous_chat_mode and time.time() >= self.continuous_chat_until:
+                        logger.info("1-Minute Continuous chat mode timed out. Reverting to strict wake-word mode.")
+                        self.stop_continuous_mode()
                         self._emit_widget_event("idle")
                 except KeyboardInterrupt:
                     print("\nAnureet Voice Assistant stopped.")
@@ -923,7 +1149,7 @@ class AnureetVoiceEngine:
                     logger.error(f"Whisper listener error: {e}")
                     time.sleep(1)
 
-    def _listen_vosk(self, model_path: str, active_session_until: float):
+    def _listen_vosk(self, model_path: str, active_session_until: float = 0.0):
         vosk_model = VoskModel(model_path)
         recognizer = KaldiRecognizer(vosk_model, 16000)
         p = pyaudio.PyAudio()
@@ -944,9 +1170,31 @@ class AnureetVoiceEngine:
                             continue
 
                         logger.info(f"Heard (Offline Vosk): '{text}'")
-                        wake_found, command_part = self.extract_wake_command(text, active_session_until)
+
+                        if CONTINUOUS_START_PATTERN.search(text):
+                            self.start_continuous_mode(60.0)
+                            self._run_command_with_mic_paused(
+                                "__continuous_start__",
+                                stream.stop_stream,
+                                stream.start_stream,
+                            )
+                            continue
+
+                        if CONTINUOUS_STOP_PATTERN.search(text):
+                            self.stop_continuous_mode()
+                            self._run_command_with_mic_paused(
+                                "__continuous_stop__",
+                                stream.stop_stream,
+                                stream.start_stream,
+                            )
+                            continue
+
+                        wake_found, command_part = self.extract_wake_command(
+                            text,
+                            continuous_mode=self.is_continuous_mode_active(),
+                        )
                         if wake_found:
-                            active_session_until = self._run_command_with_mic_paused(
+                            self._run_command_with_mic_paused(
                                 command_part,
                                 stream.stop_stream,
                                 stream.start_stream,
@@ -966,37 +1214,62 @@ class AnureetVoiceEngine:
                 pass
             p.terminate()
 
-    def _listen_speech_recognition(self, active_session_until: float):
+    def _listen_speech_recognition(self, active_session_until: float = 0.0):
         with self._open_microphone() as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
             logger.info("Microphone calibrated for ambient noise.")
 
             while True:
                 try:
-                    now = time.time()
-                    if now < active_session_until:
-                        logger.info(f"Conversational Follow-Up Mode Active ({int(active_session_until - now)}s remaining)...")
-                        self._emit_widget_event("listening")
+                    is_continuous = self.is_continuous_mode_active()
+                    if is_continuous:
+                        rem = max(0, int(self.continuous_chat_until - time.time()))
+                        logger.info(f"1-Minute Continuous Chat Mode Active ({rem}s remaining)...")
+                        self._emit_widget_event("listening", user_text="Continuous Chat Active")
                     else:
-                        logger.info("Listening for wake word 'Anureet'...")
+                        logger.info("Strict Command Mode: Listening for 'Anureet <command>'...")
 
                     audio = self.recognizer.listen(source, timeout=8, phrase_time_limit=12)
-                    raw_text = self.recognizer.recognize_google(audio, language="en-IN")
-                    text = str(raw_text[0]) if isinstance(raw_text, list) and raw_text else str(raw_text)
+                    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                    text = self._transcribe_vosk_wav(wav_bytes)
+                    if not text:
+                        continue
 
                     logger.info(f"Heard: '{text}'")
-                    wake_found, command_part = self.extract_wake_command(text, active_session_until)
+
+                    if CONTINUOUS_START_PATTERN.search(text):
+                        self.start_continuous_mode(60.0)
+                        self._run_command_with_mic_paused(
+                            "__continuous_start__",
+                            lambda: self._pause_mic_stream(source),
+                            lambda: self._resume_mic_stream(source),
+                        )
+                        continue
+
+                    if CONTINUOUS_STOP_PATTERN.search(text):
+                        self.stop_continuous_mode()
+                        self._run_command_with_mic_paused(
+                            "__continuous_stop__",
+                            lambda: self._pause_mic_stream(source),
+                            lambda: self._resume_mic_stream(source),
+                        )
+                        continue
+
+                    wake_found, command_part = self.extract_wake_command(
+                        text,
+                        continuous_mode=is_continuous,
+                    )
                     if wake_found:
-                        active_session_until = self._run_command_with_mic_paused(
+                        self._run_command_with_mic_paused(
                             command_part,
                             lambda: self._pause_mic_stream(source),
                             lambda: self._resume_mic_stream(source),
                         )
 
                 except sr.WaitTimeoutError:
-                    if time.time() >= active_session_until > 0:
-                        logger.info("Conversational session idle for 1 minute. Reverting to background wake-word listening.")
-                        active_session_until = 0.0
+                    if self.continuous_chat_mode and time.time() >= self.continuous_chat_until:
+                        logger.info("1-Minute Continuous chat mode timed out. Reverting to strict wake-word mode.")
+                        self.stop_continuous_mode()
                         self._emit_widget_event("idle")
                 except sr.UnknownValueError:
                     continue
